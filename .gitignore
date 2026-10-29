@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+# reproduction runs hold the real identity of whoever ran them: never commit them
+runs/
+bench/reports/
+bench/result.json
+# per-system prediction files written by `bench_detectors.py predict` (regenerate locally)
+bench/out/*.json
+!bench/out/heldout-*.json
+.env
+.env.*

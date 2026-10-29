@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=84.2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# The PyPI name "egress-guard" belongs to an unrelated project (checked 2026-10-29), so the distribution name here
+# is a placeholder until a PyPI name is chosen. The import name stays `egress_guard`.
+name = "identity-egress-guard"
+version = "0.1.0"
+description = "PreToolUse hook for Claude Code and Codex that stops coding agents from sending your own e-mail or name to outside services."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Chrystian Schutz" }]
+requires-python = ">=3.12"
+dependencies = []
+keywords = ["claude-code", "codex", "hooks", "privacy", "pii", "dlp", "ai-agents"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+]
+
+[project.urls]
+Source = "https://github.com/ChrystianSchutz/egress-guard"
+Changelog = "https://github.com/ChrystianSchutz/egress-guard/blob/main/CHANGELOG.md"
+
+[project.scripts]
+egress-guard-hook = "egress_guard.hook:main"
+egress-guard-shim = "egress_guard.shim:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+extend-exclude = ["runs"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "B", "S"]
+ignore = ["S101", "S311"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S"]
+"bench/*" = ["S"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
