@@ -1,7 +1,7 @@
-"""Launcher for the egress-guard PreToolUse hook that works with `python -I`.
+"""Launcher for the whoami-guard PreToolUse hook that works with `python -I`.
 
 `python -I` (isolated mode, recommended for hooks) ignores PYTHONPATH and the user site-packages, so a
-`pip install --user` copy of egress-guard is invisible to `python -I -m egress_guard.hook`. This launcher loads a
+`pip install --user` copy of whoami-guard is invisible to `python -I -m egress_guard.hook`. This launcher loads a
 pinned copy of the package from the folder next to it instead:
 
     ~/.egress-guard/run_hook.py          (this file)

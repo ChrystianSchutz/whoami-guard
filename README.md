@@ -1,4 +1,4 @@
-# egress-guard
+# whoami-guard
 
 A PreToolUse hook for **Claude Code** and **Codex** (plus a curl/wget PATH shim for any agent) that stops a coding
 agent from sending **your own identity** (account e-mail, name) to outside services.
@@ -8,12 +8,14 @@ The failure it targets is mundane: a site answers `403` and asks automated clien
 for example `curl -A "filings-fetch/1.0 (you@your-mail.com)"`, or writes it into a script that will run every night.
 Several public Claude Code issues report exactly this (anthropics/claude-code #95258, #98584, #102577, #104774).
 
-Write-up with the full measurement: https://chrystianschutz.com/blog/TODO-SLUG
+Write-up with the full measurement: https://chrystianschutz.com/blog/coding-agents-send-your-email/
 
 ## What it does
 
-- Knows *whose* data to protect. Generic PII detectors flag every e-mail address; egress-guard flags yours and lets
+- Knows *whose* data to protect. Generic PII detectors flag every e-mail address; whoami-guard flags yours and lets
   others through (the site's own sample contact, other people's addresses, a `git config` that stays local).
+  One conservative exception: your mailbox name alone (6+ characters, not just a first name) is protected too, so
+  `yourname@other-domain` is blocked as well.
 - Matches your e-mail and name in the forms we test: case, diacritics, URL and double URL encoding, HTML entities,
   base64 (also inside URL paths), `name at domain dot com`, separators, name order, Polish inflection.
 - Looks only at tool calls that can reach the network (curl, wget, Invoke-WebRequest, Python/Node one-liners,
@@ -39,16 +41,16 @@ because they cannot tell your address from anyone else's.
 
 ## Install
 
-The package is not on PyPI yet (the name `egress-guard` on PyPI belongs to an **unrelated project**: do not
-`pip install egress-guard`). Install from source:
+The package is not on PyPI yet (the name `whoami-guard` on PyPI belongs to an **unrelated project**: do not
+`pip install whoami-guard`). Install from source:
 
 ```sh
-pipx install git+https://github.com/ChrystianSchutz/egress-guard
+pipx install git+https://github.com/ChrystianSchutz/whoami-guard
 # or, into a venv you control:
-python -m venv ~/.egress-guard/venv && ~/.egress-guard/venv/bin/pip install git+https://github.com/ChrystianSchutz/egress-guard
+python -m venv ~/.egress-guard/venv && ~/.egress-guard/venv/bin/pip install git+https://github.com/ChrystianSchutz/whoami-guard
 ```
 
-Both give you an `egress-guard-hook` command (and `egress-guard-shim`). Use that command, or the venv's own
+Both give you an `whoami-guard-hook` command (and `whoami-guard-shim`). Use that command, or the venv's own
 interpreter, in the hook settings below.
 
 **About `python -I`.** Isolated mode is a good default for hooks (no `PYTHONPATH`, no current directory on
@@ -61,8 +63,8 @@ pipx, as above), or use the launcher in [`contrib/run_hook.py`](contrib/run_hook
 Check the install with one allowed and one denied event (the second line must print a `deny` decision):
 
 ```sh
-echo '{"tool_name":"Bash","tool_input":{"command":"curl -A research-script/1.0 https://example.org"}}' | egress-guard-hook
-echo '{"tool_name":"Bash","tool_input":{"command":"curl -A \"bot (you@your-mail.com)\" https://example.org"}}' | egress-guard-hook
+echo '{"tool_name":"Bash","tool_input":{"command":"curl -A research-script/1.0 https://example.org"}}' | whoami-guard-hook
+echo '{"tool_name":"Bash","tool_input":{"command":"curl -A \"bot (you@your-mail.com)\" https://example.org"}}' | whoami-guard-hook
 ```
 
 (Put `you@your-mail.com` in `identity.json` first, see below.)
@@ -71,11 +73,11 @@ echo '{"tool_name":"Bash","tool_input":{"command":"curl -A \"bot (you@your-mail.
 
 ```json
 {"hooks": {"PreToolUse": [{"matcher": "Bash|PowerShell|WebFetch|Write|Edit|MultiEdit|mcp__.*",
-  "hooks": [{"type": "command", "command": "egress-guard-hook", "onFailure": "block", "timeout": 10}]}]}}
+  "hooks": [{"type": "command", "command": "whoami-guard-hook", "onFailure": "block", "timeout": 10}]}]}}
 ```
 
 Set `"onFailure": "block"`: hooks fail open by default, so a broken install would silently let everything through.
-For lower latency there is a resident HTTP mode (`egress-guard-hook --serve 127.0.0.1:8977`, ~1 ms per call, no
+For lower latency there is a resident HTTP mode (`whoami-guard-hook --serve 127.0.0.1:8977`, ~1 ms per call, no
 process start); point a Claude Code HTTP hook at it.
 
 ### Codex (`~/.codex/config.toml`)
@@ -85,7 +87,7 @@ process start); point a Claude Code HTTP hook at it.
 matcher = "^(Bash|exec_command|shell|apply_patch|mcp__.*)$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "egress-guard-hook"
+command = "whoami-guard-hook"
 ```
 
 Codex asks you to review and trust the hook once.
@@ -96,12 +98,12 @@ Put a `curl` launcher earlier on `PATH` than the real one and set `EGRESS_GUARD_
 
 ```sh
 # curl (sh)
-exec egress-guard-shim curl "$@"
+exec whoami-guard-shim curl "$@"
 ```
 
 ```bat
 @rem curl.cmd
-@egress-guard-shim curl %*
+@whoami-guard-shim curl %*
 ```
 
 The shim also reads request bodies and headers given as files (`-d @body.json`, `-H @headers.txt`, `-K config`).
@@ -114,10 +116,15 @@ The shim also reads request bodies and headers given as files (`-d @body.json`, 
 ```
 
 - `emails`, `names`: what to protect. `extra`: any other string, matched verbatim (phone, handle).
-- `allow_hosts`: destinations where your identity may go (for example your git host).
+- `allow_hosts`: destinations where your identity may go (for example your git host). It applies to WebFetch
+  and MCP calls only. Shell commands are always scanned: a shell line can name an allowed host and still send
+  elsewhere (pipes, substitutions, git `host:path`). A `git push origin` names no identity and passes; a push to a
+  URL that contains your name is blocked.
 - `ignore`: strings cut out of a tool call (case-insensitive) before matching, for harmless text that contains your
   name, such as a project folder named after you (`cd ~/work/firstlast-blog && npm install`). Your identity elsewhere
-  in the same call is still caught. Keep entries specific: anything listed here is never inspected.
+  in the same call is still caught. Keep entries specific: anything listed here is never inspected. `ignore` only hides name matches inside one literal token (no spaces, `%` or encoded forms): your e-mail is always checked on the
+  whole call, and an entry with spaces or one that is a piece of your name (`kowalski`, `Jan-Kowalski`) is dropped.
+  Note that an agent that can write files could edit `identity.json`; protect it like other agent settings.
 - `strict`: scan every tool call, not only those that can reach the network.
 - `autodetect` (default on): also adds `git config --global user.email` / `user.name`, the Claude Code account
   e-mail from `~/.claude.json`, a "First Last" spelled by a `first.last@` address, and a git `user.name` that carries
@@ -132,12 +139,18 @@ The shim also reads request bodies and headers given as files (`-d @body.json`, 
   is outside its view. The shim covers the part of this that goes through curl/wget. In our reproduction the leaks
   came from scripts the agent wrote, which is why `Write|Edit` belong in the matcher.
 - Codex hosted tools (web search) do not pass through hooks.
+- **In the default mode, only commands the scanner recognises as network calls are checked** (curl, wget, HTTP
+  libraries, sockets, remote git commands, ...). A network tool it does not list, or one under another name, is
+  not scanned; set `"strict": true` to scan every call. A release review with Codex (9 rounds, 2026-10-30) found and
+  closed a series of such forms (pipes, substitutions, git `host:path`, `git.exe`); expect more.
+- The guard errs toward blocking: a local write next to a network command, or a file named `socket.log`, can be
+  blocked although nothing is sent.
 - Hooks fail open by default in both agents (see `onFailure` above for Claude Code).
 - A request to your own personal domain that contains your surname (`curl https://kowalczyk-studio.pl`) is flagged:
-  these are the 2 false alarms on the benchmark's test split. Add the domain to `allow_hosts`.
+  these are the 2 false alarms on the benchmark's test split. Add the domain to `allow_hosts` (fetches) or `ignore` (folder names).
 - Name matching covers English and Polish inflection; other inflected languages are not tested.
 - Our numbers come from one machine, one Claude Code version, a mock site and synthetic identities. The held-out set
-  is not adversarial. Treat egress-guard as a seatbelt, not a guarantee.
+  is not adversarial. Treat whoami-guard as a seatbelt, not a guarantee.
 
 ## Repository layout
 
@@ -168,10 +181,10 @@ python -I bench/heldout.py <tag>
 ```bibtex
 @software{schutz2026egressguard,
   author = {Schutz, Chrystian},
-  title  = {egress-guard: an identity-aware egress hook for coding agents},
+  title  = {whoami-guard: an identity-aware egress hook for coding agents},
   year   = {2026},
   version = {0.1.0},
-  url    = {https://github.com/ChrystianSchutz/egress-guard}
+  url    = {https://github.com/ChrystianSchutz/whoami-guard}
 }
 ```
 

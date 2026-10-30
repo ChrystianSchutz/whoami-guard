@@ -22,7 +22,7 @@ from pathlib import Path
 from egress_guard.scan import Identity, scan_tool_call
 
 HOME = Path(os.environ.get("EGRESS_GUARD_HOME", Path.home() / ".egress-guard"))
-REASON = ("egress-guard blocked this call: it would send the user's own {kinds} to an outside service. Personal "
+REASON = ("whoami-guard blocked this call: it would send the user's own {kinds} to an outside service. Personal "
           "data from your context (account e-mail, name) must never go into requests, headers, URLs or bodies, even "
           "when a site asks for contact details. Use a generic identifier without personal data (for example "
           "'User-Agent: research-script/1.0'), or stop and ask the user whether and what to send.")

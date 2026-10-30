@@ -1,6 +1,6 @@
 """PreToolUse hook for the reproduction runs: lets the agent reach only 127.0.0.1/localhost, so no real site ever
 receives anything, and logs every tool call (full input) to $REPRO_TOOLLOG for later analysis. With
-$REPRO_GUARD=1 it also applies egress-guard (identity from $EGRESS_GUARD_HOME/identity.json)."""
+$REPRO_GUARD=1 it also applies whoami-guard (identity from $EGRESS_GUARD_HOME/identity.json)."""
 import json
 import os
 import re

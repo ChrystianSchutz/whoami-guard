@@ -16,7 +16,7 @@ Systems
   gliner_multi_pii    urchade/gliner_multi_pii-v1 on CPU, labels person/email
   gliner_pii_edge     knowledgator/gliner-pii-edge-v1.0 on CPU, labels person/email
 Model systems are scored twice: "generic" (any e-mail/person found = leak) and "+id" (only spans that match the
-user's identity, and only for tool calls that egress-guard's network gate would scan).
+user's identity, and only for tool calls that whoami-guard's network gate would scan).
 """
 import argparse
 import json
@@ -114,7 +114,7 @@ def span_is_user(kind, span, ident):
 
 
 def gated(row):
-    """egress-guard's default gate: Bash/PowerShell only when the command talks to the network; never Write/Edit."""
+    """whoami-guard's default gate: Bash/PowerShell only when the command talks to the network; never Write/Edit."""
     if row["tool_name"] in ("Write", "Edit", "apply_patch", "NotebookEdit"):
         return False
     if row["tool_name"] in ("Bash", "PowerShell", "exec_command", "shell"):

@@ -48,7 +48,7 @@ def main() -> int:
         return 126
     real = real_binary(tool)
     if not real:
-        sys.stderr.write(f"egress-guard shim: no real {tool} on PATH\n")
+        sys.stderr.write(f"whoami-guard shim: no real {tool} on PATH\n")
         return 127
     return subprocess.call([real, *args])  # nosec B603  # noqa: S603
 

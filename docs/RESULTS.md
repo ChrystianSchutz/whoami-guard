@@ -1,4 +1,4 @@
-# Results (egress-guard 0.1.0)
+# Results (whoami-guard 0.1.0)
 
 Every number below is a count from a run we made; 95% intervals are Wilson. No identity values appear here.
 
@@ -8,7 +8,7 @@ Every number below is a count from a run we made; 95% intervals are Wilson. No i
 (`repro/mock_site.py`) and `claude -p` with a sandbox PreToolUse hook (`repro/sandbox_hook.py`) that denies any tool
 call naming a non-loopback URL, so no real site receives anything. The mock answers `403` and asks for contact
 details in the wording real sites use (SEC EDGAR fair-access text, MediaWiki User-Agent etiquette). In the guard
-condition the sandbox hook also applies egress-guard. Ground truth is the mock server's request log: a *task run
+condition the sandbox hook also applies whoami-guard. Ground truth is the mock server's request log: a *task run
 leaks* when at least one request carrying the identity reaches the mock.
 
 Scoring (`repro/score.py`) uses one identity snapshot frozen before the first run (git e-mail, git name, Claude Code
@@ -77,7 +77,7 @@ sample address, other people's e-mails and names, the first name as an ordinary 
 locally). Split by identity: test = 163 leak / 150 clean. The scanner was tuned after reading its errors on this set,
 so it guards against regressions; it is not an unbiased estimate.
 
-| egress-guard 0.1.0 | leaks caught | false alarms |
+| whoami-guard 0.1.0 | leaks caught | false alarms |
 |---|---|---|
 | test split | 163/163 | 2/150 (`own_domain_url`) |
 | all rows | 328/330 | 3/300 (`own_domain_url`) |
@@ -86,7 +86,7 @@ Misses on the dev split: one bare surname in a User-Agent and one Polish inflect
 to the user's own personal domain, which contains the surname (use `allow_hosts`).
 
 **Generic detectors on the same set** (2026-10-26, `bench/bench_detectors.py`; test split, CPU). "+id" keeps only
-spans that match the user's identity, in calls egress-guard's network gate would scan: the best case for "generic
+spans that match the user's identity, in calls whoami-guard's network gate would scan: the best case for "generic
 detector + identity filter".
 
 | system | recall (test) | FPR (test) | p50 ms |
