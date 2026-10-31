@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.1 (2026-10-31)
+
+Fixes from the final review of 0.1.0:
+
+- `allow_hosts` (WebFetch/MCP) now reads the real host of each URL: a URL with userinfo
+  (`https://trusted.test:pw@sink.test/`) is never treated as an allowed host.
+- Shell commands are split at `&&`, `||`, `;` and newlines only outside quotes, so a quoted request body such as
+  `curl ... -d 'x;git config user.email ...'` is still scanned.
+
 ## 0.1.0 (2026-10-30)
 
 First public release.

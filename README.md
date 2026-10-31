@@ -183,7 +183,7 @@ python -I bench/heldout.py <tag>
   author = {Schutz, Chrystian},
   title  = {whoami-guard: an identity-aware egress hook for coding agents},
   year   = {2026},
-  version = {0.1.0},
+  version = {0.1.1},
   url    = {https://github.com/ChrystianSchutz/whoami-guard}
 }
 ```
