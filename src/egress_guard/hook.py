@@ -19,13 +19,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from egress_guard.scan import Identity, scan_tool_call
+from egress_guard.scan import ASK_KINDS, Identity, scan_tool_call
 
 HOME = Path(os.environ.get("EGRESS_GUARD_HOME", Path.home() / ".egress-guard"))
 REASON = ("whoami-guard blocked this call: it would send the user's own {kinds} to an outside service. Personal "
           "data from your context (account e-mail, name) must never go into requests, headers, URLs or bodies, even "
           "when a site asks for contact details. Use a generic identifier without personal data (for example "
           "'User-Agent: research-script/1.0'), or stop and ask the user whether and what to send.")
+
+ASK_REASON = ("whoami-guard: this call may send personal data to an outside service ({kinds}: a look-alike form of "
+              "the user's identity, or an e-mail address in a User-Agent / From / contact field). Approve only if you "
+              "meant to send it. Agents: do not put any e-mail address in a User-Agent or contact header unless the "
+              "user gave you one for that purpose (contact_alias); use a generic identifier instead.")
 
 
 def _git(key: str) -> str:
@@ -44,7 +49,10 @@ def load_identity() -> tuple[Identity, bool]:
         cfg = json.loads(f.read_text(encoding="utf-8"))
     ident = Identity(emails=list(cfg.get("emails", [])), names=list(cfg.get("names", [])),
                      extra=list(cfg.get("extra", [])), allow_hosts=list(cfg.get("allow_hosts", [])),
-                     ignore=list(cfg.get("ignore", [])))
+                     ignore=list(cfg.get("ignore", [])), fuzzy=str(cfg.get("fuzzy", "ask")),
+                     contact_fields=str(cfg.get("contact_fields", "ask")),
+                     contact_alias=list(cfg.get("contact_alias", [])), first_alone=bool(cfg.get("first_alone", False)),
+                     scan_browser=bool(cfg.get("scan_browser", False)))
     if cfg.get("autodetect", True):
         found = _autodetect()
         for e in found["emails"]:
@@ -141,8 +149,14 @@ def decide(event: dict, ident: Identity, strict: bool) -> dict:
           "ms": round((time.perf_counter() - t0) * 1000, 3)})
     if not found:
         return {}
-    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                   "permissionDecisionReason": REASON.format(kinds=", ".join(kinds))}}
+    hard = [k for k in kinds if k not in ASK_KINDS or
+            (k == "contact-email" and ident.contact_fields == "deny") or
+            (k != "contact-email" and ident.fuzzy == "deny")]
+    if hard:
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": REASON.format(kinds=", ".join(kinds))}}
+    return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
+                                   "permissionDecisionReason": ASK_REASON.format(kinds=", ".join(kinds))}}
 
 
 def _log(rec: dict) -> None:

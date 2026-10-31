@@ -129,6 +129,31 @@ The shim also reads request bodies and headers given as files (`-d @body.json`, 
   skipped. Everything is read locally, cached for a day in `~/.egress-guard/`, and never sent anywhere.
 - `EGRESS_GUARD_HOME` moves the whole folder (identity, cache, log).
 
+### Look-alike spellings and contact fields (0.2.0)
+
+Exact matches of your identity are **denied**. Two further checks **ask** you first (Claude Code shows a permission
+prompt), because they can be wrong:
+
+- `fuzzy` (`"ask"` default, `"deny"`, `"off"`): other ways to write the same thing, not encodings. Unicode look-alikes
+  (Cyrillic/Greek letters, full-width, zero-width characters; these are treated as exact and denied), German/Polish
+  transliteration (Müller / Mueller, Schmidt / Szmit, Christian / Krystian), digits for letters (Mu11er) and one typo
+  (two for long names). Applies to `names`, `emails` and `extra`. A surname with another first name in front of it
+  ("Anna Miller" when you are "Jan Miller") is someone else and passes.
+- `contact_fields` (`"ask"` default, `"deny"`, `"off"`): **any** e-mail address, not only yours, in a field whose job
+  is to say who is calling: User-Agent (`-A`, `--user-agent`, `User-Agent:`), `From:`, `X-Contact`, `git -c
+  user.email`, `email=` / `contact=` parameters. Sites such as SEC EDGAR ask for a contact in the User-Agent, and an
+  agent fills it with the address it knows: yours. `contact_alias: ["agents@your-domain.com"]` lists addresses
+  agents may use there; placeholders (`@example.com`, noreply) pass.
+- `first_alone` (default `false`): also ask about your first name on its own (useful for a rare first name).
+- `scan_browser` (default `false`): browser tools (Playwright, Chrome MCP) are not scanned. Typing your data into a
+  form you asked the agent to fill is deliberate; tools that run page scripts (`evaluate`, `javascript`) are still
+  scanned.
+
+Measured: on the gate set recall 0.994 -> 0.997 with the same 3 false alarms as 0.1.1 (the fuzzy check added none;
+40 rows that put someone else's address in a User-Agent now ask by design and are counted apart). Replaying 73,830
+tool calls from the author's own Claude Code transcripts: 0 fuzzy questions, 24 contact-field questions. Ciphers
+(rot13, hex, a custom code) are out of scope: a pattern matcher cannot stop an agent that tries to hide.
+
 ## Known gaps and limits
 
 - **It checks tool calls; it is not network isolation.** A hook sees only what a tool call contains. A script that
@@ -180,7 +205,7 @@ python -I bench/heldout.py <tag>
   author = {Schutz, Chrystian},
   title  = {whoami-guard: an identity-aware egress hook for coding agents},
   year   = {2026},
-  version = {0.1.1},
+  version = {0.2.0},
   url    = {https://github.com/ChrystianSchutz/whoami-guard}
 }
 ```

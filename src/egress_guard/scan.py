@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote_plus, urlsplit
 
+from egress_guard.fuzzy import clean, contact_hits, fuzzy_hits
+
 _FOLD = str.maketrans({"ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "ß": "ss", "đ": "d", "Đ": "D", "æ": "ae", "œ": "oe"})
 _B64 = re.compile(r"[A-Za-z0-9+/_-]{12,}={0,2}")
 _AT = re.compile(r"\s*(?:\(at\)|\[at\]|\{at\}|<at>|\bat\b|\bmałpa\b|\bmalpa\b)\s*", re.IGNORECASE)
@@ -102,6 +104,10 @@ def squash(s: str) -> str:
 def views(text: str) -> list[str]:
     """The text as the receiving server may read it: decoded URLs and HTML, base64 runs, spelled-out @ and dots."""
     out, cur = [text], text
+    lookalike = clean(text)  # Cyrillic/Greek look-alike letters, full-width, zero-width characters
+    if lookalike != text:
+        out.append(lookalike)
+        cur = lookalike
     for _ in range(2):  # double URL-encoding
         nxt = unquote_plus(cur)
         if nxt == cur:
@@ -150,6 +156,12 @@ class Identity:
     # strings that contain the identity but are fine to send (a folder or domain named after the user, a public
     # handle); they are cut out of the call before matching, case-insensitively
     ignore: list[str] = field(default_factory=list)
+    # 0.2.0: look-alike spellings and e-mails in contact fields; "ask" (the user decides), "deny" or "off"
+    fuzzy: str = "ask"
+    contact_fields: str = "ask"
+    contact_alias: list[str] = field(default_factory=list)  # addresses agents may put in a User-Agent / From
+    first_alone: bool = False  # also ask about the first name on its own (useful for a rare first name)
+    scan_browser: bool = False  # browser tools (Playwright, Chrome): filling a form with your data is your call
 
     def needles(self) -> list[tuple[str, str, str]]:
         """(kind, folded needle, squashed needle) for every form we look for."""
@@ -333,6 +345,9 @@ def safe_ignore(ident: Identity) -> list[str]:
 def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = False,
                    cwd: str | None = None) -> list[Finding]:
     """Findings for one PreToolUse event (Claude Code and Codex send the same tool_name / tool_input shape)."""
+    if tool_name.startswith("mcp__") and BROWSER.search(tool_name) and not BROWSER_CODE.search(tool_name) and \
+            not ident.scan_browser:
+        return []  # clicking and typing in a browser is visible and deliberate; running page scripts is not
     texts = strings_of(tool_input)
     joined = "\n".join(texts)
     if isinstance(tool_input, dict) and isinstance(tool_input.get("workdir"), str):
@@ -369,4 +384,23 @@ def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = F
             if (f.kind, f.needle) not in seen:
                 seen.add((f.kind, f.needle))
                 out.append(f)
+    if out:
+        return out
+    for t in texts:
+        extra = []
+        if ident.fuzzy != "off":
+            extra += fuzzy_hits(cut.sub(" ", t) if cut else t, ident.emails, ident.names,
+                                ident.first_alone, ident.extra, ident.derived_names)
+        if ident.contact_fields != "off":
+            extra += contact_hits(t, ident.contact_alias)
+        for kind, what in extra:
+            if (kind, what) not in seen:
+                seen.add((kind, what))
+                out.append(Finding(kind, fold(what), t[:80]))
     return out
+
+
+# findings that are a question for the user (by default), not a hard block
+ASK_KINDS = {"name-fuzzy", "surname-fuzzy", "first-fuzzy", "email-fuzzy", "extra-fuzzy", "contact-email"}
+BROWSER = re.compile(r"playwright|puppeteer|chrome|browser|selenium", re.IGNORECASE)
+BROWSER_CODE = re.compile(r"javascript|evaluate|run_code|execute|script", re.IGNORECASE)

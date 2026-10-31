@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 (2026-11-01)
+
+- Fuzzy matching of the identity (`fuzzy`: ask / deny / off): Unicode look-alikes and zero-width characters (denied
+  as exact), German/Polish transliteration, digits for letters, one or two typos; also for `extra` phrases.
+- Contact-field rule (`contact_fields`: ask / deny / off): any e-mail address in User-Agent, From, X-Contact,
+  git user.email or e-mail URL parameters asks first; `contact_alias` lists addresses agents may use there.
+- Browser MCP tools (Playwright, Chrome) are not scanned unless `scan_browser` is set; page-script tools still are.
+- The hook now returns `ask` for these findings and `deny` for exact ones.
+- Not reviewed by a second model before release (owner's decision, 2026-11-01).
+
 ## 0.1.1 (2026-10-31)
 
 Fixes from the final review of 0.1.0:
