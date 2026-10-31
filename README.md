@@ -41,8 +41,7 @@ because they cannot tell your address from anyone else's.
 
 ## Install
 
-The package is not on PyPI yet (the name `whoami-guard` on PyPI belongs to an **unrelated project**: do not
-`pip install whoami-guard`). Install from source:
+The package is not on PyPI yet. Install from source:
 
 ```sh
 pipx install git+https://github.com/ChrystianSchutz/whoami-guard
