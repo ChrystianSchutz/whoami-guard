@@ -41,12 +41,10 @@ because they cannot tell your address from anyone else's.
 
 ## Install
 
-The package is not on PyPI yet. Install from source:
-
 ```sh
-pipx install git+https://github.com/ChrystianSchutz/whoami-guard
+pipx install whoami-guard
 # or, into a venv you control:
-python -m venv ~/.egress-guard/venv && ~/.egress-guard/venv/bin/pip install git+https://github.com/ChrystianSchutz/whoami-guard
+python -m venv ~/.egress-guard/venv && ~/.egress-guard/venv/bin/pip install whoami-guard
 ```
 
 Both give you an `whoami-guard-hook` command (and `whoami-guard-shim`). Use that command, or the venv's own
