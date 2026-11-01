@@ -161,9 +161,15 @@ The shim also reads request bodies and headers given as files (`-d @body.json`, 
 - **Session exceptions** (`whoami-guard-allow`, run by you inside the agent session with the `!` prefix, which Claude
   Code runs outside the hooks): `--email ADDR` / `--host HOST` add to the allow lists for this session only;
   no list means questions instead of blocks; `--off` turns checks off; a number sets the hours (default 2);
-  `--list`, `--clear`. "This session" is the session of the last tool call the hook saw; the command prints its
-  folder. The hook denies agent tool calls that run this command, set `EGRESS_GUARD_*` variables or write into the
-  whoami-guard folder, so an agent cannot grant itself an exception.
+  `--list`, `--clear`. The block message gives the exact command with `--session <id>` of the session that asked.
+  Without `--session` the command takes the session of the last tool call the hook saw and refuses when several
+  sessions were active in the last 10 minutes. Malformed exception files grant nothing and `--clear` always works.
+- **Self-protection:** the hook denies agent shell commands that run the allow command (also quoted or by full
+  path), set `EGRESS_GUARD_*` variables, write into the whoami-guard folder or the agent's hook settings, or run code
+  that names them (`python -c "...'.egress-guard'..."`), and file edits that remove the hook entry from
+  `~/.claude/settings.json` or `~/.codex/config.toml`. Commands that only read (grep, cat, ls, git log) pass. A script
+  written first and run later is not seen: this keeps a well-meaning agent from "fixing" a block by itself, it does
+  not stop one that hides what it does.
 - Per terminal: `EGRESS_GUARD_MODE=ask` (questions instead of blocks) or `off`, set before starting the agent.
 - **Codex** has no "ask": add `--codex` to the hook command there and every question becomes a block.
 
@@ -180,6 +186,8 @@ agent that hides.
   is outside its view. The shim covers the part of this that goes through curl/wget. In our reproduction the leaks
   came from scripts the agent wrote, which is why `Write|Edit` belong in the matcher.
 - Codex hosted tools (web search) do not pass through hooks.
+- Tool calls over 256 KB get exact checks only (no look-alike spellings, no contact fields), so the hook stays
+  under its timeout (an 8 MB call took 13 s otherwise).
 - **In the default mode, only commands the scanner recognises as network calls are checked** (curl, wget, HTTP
   libraries, sockets, remote git commands, ...). A network tool it does not list, or one under another name, is
   not scanned; set `"strict": true` to scan every call. A release review with Codex (9 rounds, 2026-10-30) found and
@@ -224,7 +232,7 @@ python -I bench/heldout.py <tag>
   author = {Schutz, Chrystian},
   title  = {whoami-guard: an identity-aware egress hook for coding agents},
   year   = {2026},
-  version = {0.2.1},
+  version = {0.2.2},
   url    = {https://github.com/ChrystianSchutz/whoami-guard}
 }
 ```

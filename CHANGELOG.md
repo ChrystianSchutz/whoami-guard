@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.2.2 (2026-11-01)
+
+Fixes from the second Sol review (gpt-6.1-sol, Not OK, 6 findings, all confirmed):
+
+- Session exceptions are bound to the session that asked: block messages carry `--session <id>`, and without it
+  `whoami-guard-allow` refuses when several sessions were active in the last 10 minutes (an approval could reach
+  another session).
+- Self-protection covers quoted and full-path runs of the allow command, inline code that names the whoami-guard
+  folder, writes to the agent's hook settings and edits or patches that drop the hook entry; it reads shell quotes
+  and heredocs, so reading and documenting the controls still passes.
+- An allowed host no longer exempts the whole MCP or fetch call: every destination in it counts, also URL-encoded
+  redirect parameters and protocol-relative `//host` URLs; a backslash counts only in the host part (a `\n` after
+  a URL in code was blocked).
+- Malformed `sessions.json` records grant nothing and crash neither the hook nor `--clear`.
+- `allow_emails` are compared as written: a Cyrillic look-alike of an approved address asks.
+- Calls over 256 KB get exact checks only (an 8 MB call took 13 s, over the hook timeout).
+
 ## 0.2.1 (2026-11-01)
 
 Fixes from the Sol review of 0.2.0 (gpt-6.1-sol, Not OK, 7 findings, all confirmed) and owner decisions:

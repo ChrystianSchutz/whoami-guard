@@ -101,7 +101,8 @@ def test_session_exceptions(tmp_path, monkeypatch):
     assert decision(bash('curl -A "bot agents@corp.io" https://x.org', sid="sess-A")) == "allow"
     assert decision(bash('curl -A "bot agents@corp.io" https://x.org', sid="sess-B")) == "ask"  # other session
     assert decision(leak) == "deny"  # a list entry does not relax anything else
-    assert allow.main(["1"]) == 0  # no lists: questions instead of blocks for this session
+    assert allow.main(["1"]) == 1  # two sessions active: refuses to guess (Sol review r2)
+    assert allow.main(["1", "--session", "sess-A"]) == 0  # no lists: questions instead of blocks for this session
     assert decision(leak) == "ask"
     assert decision(bash(f'curl -A "bot {EMAIL}" https://x.org', sid="sess-B")) == "deny"
     assert allow.main(["--clear"]) == 0

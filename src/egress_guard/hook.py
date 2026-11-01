@@ -142,37 +142,140 @@ def _claude_email() -> str:
         return ""
 
 
-SELF_REASON = ("whoami-guard: only the user may change whoami-guard's settings or exceptions (identity.json, "
-               "sessions.json, whoami-guard-allow). Ask the user; they can run `! whoami-guard-allow` in this session.")
-# the agent must not grant itself an exception: shell commands that name the control files or the allow command,
-# and file tools that write into the whoami-guard folder, are denied (the user's own `!` commands are not hooked)
-# Only real attempts count: running the allow command, setting an EGRESS_GUARD_* variable, or a write, copy, move or
-# delete that names the whoami-guard folder. A command that merely mentions them (docs, grep, reading the log) passes
-# (the broad 0.2.1 draft blocked the author's own doc edits, 2026-11-01).
-_CONTROL = re.compile(
-    r"(?:^|[\n;&|(`]|\b(?:sudo|env|exec|then|do)\s)\s*whoami-guard-allow\b"
-    r"|\begress_guard\.allow\b"
-    r"|(?:\bexport\s+|\$env:|\bset\s+|\bsetx\s+|(?:^|[\s;&|])(?=EGRESS_GUARD_))EGRESS_GUARD_\w+\s*="
-    r"|(?:>>?|\btee\b|\bcp\b|\bmv\b|\brm\b|\bln\b|\bsed\s+-i|\bperl\s+-[a-z]*i|\btruncate\b|\bdd\b|"
-    r"Set-Content|Add-Content|Out-File|Remove-Item|New-Item|Copy-Item|Move-Item|Rename-Item|\.write_text|"
-    r"\.write\(|open\([^)]*['\"][wa])[^\n;&|]*\.egress-guard",
-    re.IGNORECASE)
+SELF_REASON = ("whoami-guard: only the user may change whoami-guard's settings or exceptions (its folder, "
+               "whoami-guard-allow, EGRESS_GUARD_* variables, the hook entry in the agent's settings). Ask the user; "
+               "they can run `! whoami-guard-allow` in this session.")
+# The agent must not grant itself an exception or switch the hook off (the user's own `!` commands are not hooked).
+# A shell segment that names a control (the allow command, the whoami-guard folder, an EGRESS_GUARD_* assignment,
+# the agent's hook settings) is denied unless it only reads (grep, cat, ls, git log ...), so docs and log reading
+# pass and `"whoami-guard-allow"`, `/usr/bin/whoami-guard-allow`, `python -c "...'.egress-guard'..."` do not
+# (Sol review r2, 2026-11-01). A script written first and run later is not seen: a seatbelt, not a sandbox.
+_CTRL = re.compile(r"whoami-guard-allow|egress_guard[./\\]allow|\.egress-guard|"
+                   r"\.claude[/\\]+settings(?:\.local)?\.json|\.codex[/\\]+(?:config\.toml|hooks\.json)", re.I)
+_ASSIGN = re.compile(r"(?:^|[\s;&|(]|\$env:)EGRESS_GUARD_\w+\s*=|\b(?:setx|set)\s+EGRESS_GUARD_\w+", re.I)
+# a write INTO a control file: redirect or tee target, sed -i / perl -i on it, PowerShell writers
+_WRITE = re.compile(r"(?:>>?|\btee\s+(?:-a\s+)?|Set-Content|Add-Content|Out-File)\s*(?:-\w+\s+)*[\"']?[^\s;&|]*(?:"
+                    + _CTRL.pattern + r")|\b(?:sed|perl)\s+-[a-z]*i\b.*(?:" + _CTRL.pattern + r")", re.I)
+# commands that only read or print; a control named in them is a mention, not an attempt
+_READERS = {"for", "if", "while", "echo", "printf", "which", "where", "grep", "egrep", "rg", "cat", "type", "head",
+            "tail", "less", "more", "ls", "dir", "wc", "file", "stat", "find", "git", "get-content", "gc",
+            "select-string", "sls", "get-childitem", "gci", "test-path", "jq", "diff", "cut", "sort", "uniq", "nl",
+            "od", "xxd", "sha256sum", "md5sum", "tee"}
+_HEREDOC = re.compile(r"<<-?\s*['\"]?(\w+)['\"]?")
+
+
+def _segments(cmd: str) -> list[str]:
+    """Split a shell line on unquoted ; | & and newlines; a heredoc body stays with the command that reads it."""
+    out, cur, q, i, n = [], [], "", 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if q:
+            cur.append(c)
+            if c == q:
+                q = ""
+            elif c == "\\" and q == '"' and i + 1 < n:
+                cur.append(cmd[i + 1])
+                i += 1
+        elif c in "'\"":
+            q = c
+            cur.append(c)
+        elif c == "<" and (m := _HEREDOC.match(cmd, i)):
+            end = re.compile(r"^\s*" + re.escape(m.group(1)) + r"\s*$", re.M).search(cmd, m.end())
+            stop = end.end() if end else n
+            cur.append(cmd[i:stop])
+            i = stop
+            continue
+        elif c in ";|&\n":
+            out.append("".join(cur))
+            cur = []
+        else:
+            cur.append(c)
+        i += 1
+    out.append("".join(cur))
+    return [x for x in out if x.strip()]
+
+
+_MARK = re.compile(r"whoami-guard|egress_guard|egress-guard", re.I)
+_SETTINGS = re.compile(r"[/\\]\.claude[/\\]settings(?:\.local)?\.json$|[/\\]\.codex[/\\](?:config\.toml|hooks\.json)$",
+                       re.I)
+
+
+def _first_word(seg: str) -> str:
+    seg = re.sub(r"^\s*(?:\w+=\S*\s+)*", "", seg)  # leading VAR=value
+    w = seg.strip().split(None, 1)[0] if seg.strip() else ""
+    return re.split(r"[/\\]", w.strip("\"'`()"))[-1].lower().removesuffix(".exe")
+
+
+def _shell_touches(cmd: str) -> bool:
+    if _ASSIGN.search(cmd):
+        return True
+    for seg in _segments(cmd):
+        head = _HEREDOC.split(seg, 1)[0]  # `cat > notes.md <<EOF ... EOF`: the heredoc text is data, not a command
+        if not _CTRL.search(head if _first_word(seg) in _READERS else seg):
+            continue
+        if _WRITE.search(head) or re.search(r"\bfind\b.*-(?:delete|exec)", head) or _first_word(seg) not in _READERS:
+            return True
+    return False
+
+
+def _drops_hook(path: str, inp: dict) -> bool:
+    """A file tool edit of the agent's settings that removes the whoami-guard hook entry."""
+    if not _SETTINGS.search(path.replace("\\", "/").replace("/", "\\")) and not _SETTINGS.search(path):
+        return False
+    if "old_string" in inp:  # Edit
+        return len(_MARK.findall(str(inp.get("old_string")))) > len(_MARK.findall(str(inp.get("new_string") or "")))
+    if "edits" in inp:  # MultiEdit
+        return any(isinstance(e, dict) and len(_MARK.findall(str(e.get("old_string")))) >
+                   len(_MARK.findall(str(e.get("new_string") or ""))) for e in inp.get("edits") or [])
+    if "content" in inp:  # Write
+        try:
+            old = Path(path).expanduser().read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            return False
+        return bool(_MARK.search(old)) and not _MARK.search(str(inp.get("content")))
+    return False
+
+
+def _patch_touches(patch: str) -> bool:
+    """Codex apply_patch: a file in the whoami-guard folder, or a settings file losing its hook lines."""
+    for m in re.finditer(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$((?:\n(?!\*\*\* ).*)*)", patch, re.M):
+        path, body = m.group(1).strip(), m.group(2)
+        if ".egress-guard" in path.replace("\\", "/"):
+            return True
+        if _SETTINGS.search(path) or re.search(r"(?:^|[/\\])(?:settings(?:\.local)?\.json|config\.toml|hooks\.json)$",
+                                               path):
+            removed = sum(len(_MARK.findall(ln)) for ln in body.splitlines() if ln.startswith("-"))
+            added = sum(len(_MARK.findall(ln)) for ln in body.splitlines() if ln.startswith("+"))
+            if removed > added or "Delete File" in m.group(0).split("\n", 1)[0]:
+                return True
+    return False
 
 
 def _touches_controls(event: dict) -> bool:
     tool, inp = event.get("tool_name", ""), event.get("tool_input") or {}
+    if isinstance(inp, str):
+        return tool == "apply_patch" and _patch_touches(inp)
     if not isinstance(inp, dict):
         return False
     if tool in ("Bash", "PowerShell", "exec_command", "shell"):
-        return any(_CONTROL.search(v) for v in inp.values() if isinstance(v, str))
+        return any(_shell_touches(v) for v in inp.values() if isinstance(v, str)) or \
+            any(_shell_touches(" ".join(map(str, v))) for v in inp.values() if isinstance(v, list))
+    if tool == "apply_patch":
+        return any(_patch_touches(v) for v in inp.values() if isinstance(v, str))
     path = str(inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or "")
     if path:
         try:
             p = Path(path).expanduser().resolve()
-            return p == HOME.resolve() or HOME.resolve() in p.parents
+            if p == HOME.resolve() or HOME.resolve() in p.parents:
+                return True
         except (OSError, ValueError):
             return True
+        return _drops_hook(path, inp)
     return False
+
+
+def _strs(v) -> list[str]:
+    return [str(x) for x in v if isinstance(x, (str, int, float))] if isinstance(v, list) else []
 
 
 def session_rec(session_id: str) -> dict:
@@ -182,9 +285,12 @@ def session_rec(session_id: str) -> dict:
         return {}
     try:
         rec = json.loads((HOME / "sessions.json").read_text(encoding="utf-8")).get(session_id) or {}
-    except (OSError, ValueError, AttributeError):
-        return {}
-    return rec if isinstance(rec, dict) and float(rec.get("until", 0)) > time.time() else {}
+        if not isinstance(rec, dict) or float(rec.get("until", 0)) <= time.time():
+            return {}
+    except (OSError, ValueError, TypeError, AttributeError):
+        return {}  # a broken record grants nothing and never crashes the hook (Sol review r2)
+    mode = rec.get("mode") if rec.get("mode") in ("ask", "off") else ""
+    return {"mode": mode, "emails": _strs(rec.get("emails")), "hosts": _strs(rec.get("hosts"))}
 
 
 _HOST = re.compile(r"https?://(?:[^/\s'\"@]*@)?([A-Za-z0-9.-]+)", re.IGNORECASE)
@@ -204,6 +310,9 @@ def _escalation(ident: Identity, event: dict) -> str:
                 + ", ".join(ident.allow_emails[:5]) + ".")
     hosts = _hosts(event)
     cmd = " ".join(f"--host {h}" for h in hosts) or "--email <address>"
+    sid = str(event.get("session_id") or "")
+    if sid:  # bind the approval to the session that asked, not to whichever session logged last (Sol review r2)
+        cmd += f" --session {sid[:12]}"
     out += (" If sending this is really needed for the user's task, stop and ask the user: say what you want to send, "
             "to which site and why, and give them this command to approve it for this session only: "
             f"`! whoami-guard-allow {cmd}`. Do not retry with the data rewritten or encoded.")

@@ -35,6 +35,8 @@ _GERMAN = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "AE", "Ö": "
 def clean(s: str) -> str:
     """Unicode look-alikes to Latin, zero-width and other invisible format characters removed, diacritics removed,
     case kept (so word boundaries such as 'JanKowalski' survive)."""
+    if s.isascii():  # no look-alikes, invisible or combining characters in ASCII
+        return s
     s = unicodedata.normalize("NFKC", s)
     s = "".join(c for c in s if unicodedata.category(c) != "Cf").translate(_CONFUSABLE)
     s = unicodedata.normalize("NFKD", s)
@@ -233,12 +235,15 @@ _PLACEHOLDER = re.compile(r"(?i)@(?:[\w-]+\.)*(?:example\.(?:com|org|net)|exampl
 
 def contact_hits(text: str, alias: list[str]) -> list[tuple[str, str]]:
     """E-mail addresses (anyone's) in User-Agent, From, contact headers, git user.email or e-mail URL parameters."""
-    allowed = {clean(a).strip().lower() for a in alias if "@" in a}  # exact addresses only: agent.s@ is not agents@
+    # exact addresses only: agent.s@ is not agents@, and a Cyrillic 'о' in the domain is another domain, so the
+    # approval is checked on the address as written, look-alike folding is only for finding it (Sol review r2)
+    allowed = {a.strip().lower() for a in alias if "@" in a}
     out = []
     for m in _FIELD.finditer(text):
         val = unquote(next((g for g in m.groups() if g is not None), ""))
+        raw = {e.lower() for e in find_emails(val)}
         for e in find_emails(clean(val)):
-            if e.lower() in allowed or _PLACEHOLDER.search(e):
+            if (e.lower() in allowed and e.lower() in raw) or _PLACEHOLDER.search(e):
                 continue
             out.append(("contact-email", e))
     return out

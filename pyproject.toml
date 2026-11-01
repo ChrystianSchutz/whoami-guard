@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 # The PyPI name "whoami-guard" belongs to an unrelated project (checked 2026-10-29), so the distribution name here
 # is a placeholder until a PyPI name is chosen. The import name stays `egress_guard`.
 name = "whoami-guard"
-version = "0.2.1"
+version = "0.2.2"
 description = "PreToolUse hook for Claude Code and Codex that stops coding agents from sending your own e-mail or name to outside services."
 readme = "README.md"
 license = "MIT"

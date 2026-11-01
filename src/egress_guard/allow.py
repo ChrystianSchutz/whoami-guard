@@ -10,7 +10,9 @@ Run it inside the agent session with the `!` prefix (Claude Code runs `!` comman
     ! whoami-guard-allow --list                  # running exceptions
     ! whoami-guard-allow --clear                 # end all exceptions
 
-"This session" is the session of the last tool call the hook saw; the command prints its folder so you can check.
+The block message gives the exact command with `--session <id>` for the session that asked. Without --session the
+command uses the session of the last tool call the hook saw, and refuses when several sessions were active in the
+last 10 minutes (it lists them). It prints the folder of the session it changed.
 The agent cannot run this itself: the hook denies tool calls that name this command or the whoami-guard folder.
 """
 import json
@@ -19,31 +21,66 @@ import time
 
 from egress_guard.hook import HOME
 
-USAGE = "usage: whoami-guard-allow [HOURS] [--email ADDR]... [--host HOST]... [--ask|--off] [--list|--clear]"
+USAGE = ("usage: whoami-guard-allow [HOURS] [--email ADDR]... [--host HOST]... [--ask|--off] "
+         "[--session ID] [--list|--clear]")
+
+
+def _until(v) -> float:
+    try:
+        return float(v.get("until", 0)) if isinstance(v, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _list(v) -> list[str]:
+    return [str(x) for x in v if isinstance(x, str)] if isinstance(v, list) else []
 
 
 def _load() -> dict:
+    """Running exceptions; malformed records are dropped instead of crashing (Sol review r2)."""
     try:
         d = json.loads((HOME / "sessions.json").read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
     except (OSError, ValueError):
         return {}
+    now = time.time()
+    return {str(k): v for k, v in d.items() if _until(v) > now} if isinstance(d, dict) else {}
 
 
-def _last_session() -> tuple[str, str]:
-    """(session id, folder name) of the newest hook log record that has a session."""
+def _sessions() -> list[tuple[str, str, float]]:
+    """(session id, folder, last seen) from the hook log, newest first."""
     try:
-        lines = (HOME / "log.jsonl").read_text(encoding="utf-8").splitlines()[-2000:]
+        lines = (HOME / "log.jsonl").read_text(encoding="utf-8").splitlines()[-5000:]
     except OSError:
-        return "", ""
+        return []
+    seen: dict[str, tuple[str, float]] = {}
     for line in reversed(lines):
         try:
             rec = json.loads(line)
-        except ValueError:
+            sid = str(rec.get("session") or "")
+            if sid and sid not in seen:
+                seen[sid] = (str(rec.get("folder") or ""), float(rec.get("ts") or 0))
+        except (ValueError, TypeError, AttributeError):
             continue
-        if rec.get("session"):
-            return str(rec["session"]), str(rec.get("folder") or "")
-    return "", ""
+    return [(k, f, t) for k, (f, t) in seen.items()]
+
+
+def _pick_session(prefix: str) -> tuple[str, str, str]:
+    """(session id, folder, error)."""
+    sessions = _sessions()
+    if prefix:
+        hits = [s for s in sessions if s[0].startswith(prefix)] or \
+               [(k, "", 0.0) for k in _load() if k.startswith(prefix)]
+        if len(hits) != 1:
+            return "", "", f"--session {prefix}: {'no' if not hits else 'more than one'} matching session"
+        return hits[0][0], hits[0][1], ""
+    if not sessions:
+        return "", "", "no session found in the hook log"
+    recent = [s for s in sessions if s[2] >= sessions[0][2] - 600]
+    if len(recent) > 1:
+        listing = "; ".join(f"--session {s[0][:12]} (folder {s[1] or '?'})" for s in recent[:6])
+        return "", "", ("several agent sessions were active in the last 10 minutes; use the command from the block "
+                        "message, or add one of: " + listing)
+    return sessions[0][0], sessions[0][1], ""
 
 
 def _values(args: list[str], flag: str) -> list[str]:
@@ -62,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         print(USAGE)
         return 0
     now = time.time()
-    data = {k: v for k, v in _load().items() if isinstance(v, dict) and float(v.get("until", 0)) > now}
+    data = _load()
     if "--clear" in args:
         data = {}
         print("whoami-guard: all session exceptions ended")
@@ -70,19 +107,19 @@ def main(argv: list[str] | None = None) -> int:
         for sid, v in data.items():
             print(f"{sid[:8]}...  folder={v.get('folder', '')}  mode={v.get('mode') or 'normal'}  "
                   f"emails={v.get('emails', [])}  hosts={v.get('hosts', [])}  "
-                  f"{round((float(v['until']) - now) / 3600, 1)} h left")
+                  f"{round((_until(v) - now) / 3600, 1)} h left")
         if not data:
             print("whoami-guard: no session exceptions")
         return 0
     else:
-        sid, folder = next(((a.split("=", 1)[1], "") for a in args if a.startswith("--session=")), ("", ""))
-        if not sid:
-            sid, folder = _last_session()
-        if not sid:
-            print("whoami-guard: no session found in the hook log; nothing changed", file=sys.stderr)
+        prefix = next((a.split("=", 1)[1] for a in args if a.startswith("--session=")), "") or \
+            (_values(args, "--session") or [""])[0]
+        sid, folder, err = _pick_session(prefix.strip())
+        if err:
+            print(f"whoami-guard: {err}; nothing changed", file=sys.stderr)
             return 1
         emails, hosts = _values(args, "--email"), _values(args, "--host")
-        skip = {i + 1 for i, a in enumerate(args) if a in ("--email", "--host")}
+        skip = {i + 1 for i, a in enumerate(args) if a in ("--email", "--host", "--session")}
         nums = [a for i, a in enumerate(args) if i not in skip and a.replace(".", "", 1).isdigit()]
         hours = float(nums[0]) if nums else 2.0
         mode = "off" if "--off" in args else "ask" if ("--ask" in args or not (emails or hosts)) else ""
@@ -90,8 +127,8 @@ def main(argv: list[str] | None = None) -> int:
         rec.update(until=now + hours * 3600, folder=folder or rec.get("folder", ""))
         if mode:
             rec["mode"] = mode
-        rec["emails"] = sorted(set(rec.get("emails", [])) | set(emails))
-        rec["hosts"] = sorted(set(rec.get("hosts", [])) | set(hosts))
+        rec["emails"] = sorted(set(_list(rec.get("emails"))) | set(emails))
+        rec["hosts"] = sorted(set(_list(rec.get("hosts"))) | set(hosts))
         data[sid] = rec
         print(f"whoami-guard: session {sid[:8]}... (folder {rec['folder'] or '?'}) for {hours:g} h: "
               f"mode={rec.get('mode') or 'normal'}, emails={rec['emails']}, hosts={rec['hosts']}")

