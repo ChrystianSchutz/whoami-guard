@@ -41,6 +41,24 @@ because they cannot tell your address from anyone else's.
 
 ## Install
 
+**Quickest: [uv](https://docs.astral.sh/uv/)**, which brings its own Python, so you do not need one installed.
+
+```sh
+# 1. install uv (once)
+curl -LsSf https://astral.sh/uv/install.sh | sh                                    # macOS / Linux
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"  # Windows
+
+# 2. install whoami-guard as a tool (puts whoami-guard-hook, -shim and -allow on your PATH)
+uv tool install whoami-guard
+uv tool update-shell   # only if the commands are not found in a new terminal
+```
+
+No install at all: point the hook at `uvx --from whoami-guard==0.2.2 whoami-guard-hook`. uv downloads and caches
+it on first use; pinning the version keeps the hook from changing under you. Approve a one-off exception the
+same way: `uvx --from whoami-guard whoami-guard-allow --host example.com`.
+
+Other ways:
+
 ```sh
 pipx install whoami-guard
 # or, into a venv you control:
