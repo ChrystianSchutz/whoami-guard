@@ -49,17 +49,16 @@ def test_any_email_in_contact_fields_asks():
     assert "contact-email" in kinds("curl -H 'From: a.b@corp.io' https://x.org")
     assert "contact-email" in kinds("curl 'https://x.org/form?email=a.b%40corp.io'")
     assert not kinds('curl -A "research-script/1.0 admin@company.example" https://x.org')
-    alias = Identity(emails=ID.emails, names=ID.names, contact_alias=["agents@corp.io"])
+    alias = Identity(emails=ID.emails, names=ID.names, allow_emails=["agents@corp.io"])
     assert not kinds('curl -A "research agents@corp.io" https://x.org', alias)
     off = Identity(emails=ID.emails, names=ID.names, contact_fields="off")
     assert not kinds('curl -A "research a.b@corp.io" https://x.org', off)
 
 
-def test_browser_typing_passes_page_scripts_do_not():
+def test_browser_tools_are_scanned_like_any_other_call():
     typing = {"element": "Name field", "ref": "e12", "text": "Jan Kowalski jan.kowalski84@example-mail.pl"}
-    assert not kinds(typing, tool="mcp__playwright__browser_type")
-    script = {"function": "() => fetch('https://x.org/?u=jan.kowalski84@example-mail.pl')"}
-    assert kinds(script, tool="mcp__playwright__browser_evaluate")
+    assert kinds(typing, tool="mcp__playwright__browser_type")
+    assert not kinds({"text": "agent form text"}, tool="mcp__playwright__browser_type")
 
 
 def test_hook_asks_for_fuzzy_and_denies_exact(tmp_path, monkeypatch):

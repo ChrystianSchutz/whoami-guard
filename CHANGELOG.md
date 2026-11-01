@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.1 (2026-11-01)
+
+Fixes from the Sol review of 0.2.0 (gpt-6.1-sol, Not OK, 7 findings, all confirmed) and owner decisions:
+
+- Browser MCP tools are scanned again like every other call (0.2.0 skipped them: an identity in a navigation URL
+  passed, a regression). `allow_hosts` lets navigation to listed sites through.
+- Codex: `--codex` turns every question into a block (Codex treats "ask" as unsupported and runs the tool).
+- E-mail extraction is linear (a 100 KB malformed User-Agent took 54 s in 0.2.0, over the hook timeout).
+- Header values are read up to the end of the quoted argument (`-H "User-Agent: bot x@y"`, `From: Name <x@y>`,
+  `-Ax@y`, HTTPie); fuzzy checks also read URL-decoded and base64 views; short sound keys keep one typo for long
+  names but never more typos than key letters beyond 3 (a replay found 3,848 false questions otherwise); digits
+  for letters in e-mail addresses.
+- `allow_emails` (was `contact_alias`, still read) matches exact addresses only; `noreply` only as a whole local
+  part or the GitHub noreply domain.
+- New: `allow_hosts` in shell commands asks instead of blocking; block messages name the approved addresses and the
+  exact approval command; per-session exceptions (`whoami-guard-allow`) with self-protection; `EGRESS_GUARD_MODE`
+  per terminal.
+
 ## 0.2.0 (2026-11-01)
 
 - Fuzzy matching of the identity (`fuzzy`: ask / deny / off): Unicode look-alikes and zero-width characters (denied

@@ -84,7 +84,7 @@ process start); point a Claude Code HTTP hook at it.
 matcher = "^(Bash|exec_command|shell|apply_patch|mcp__.*)$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
-command = "whoami-guard-hook"
+command = "whoami-guard-hook --codex"   # Codex has no "ask": questions become blocks
 ```
 
 Codex asks you to review and trust the hook once.
@@ -129,30 +129,49 @@ The shim also reads request bodies and headers given as files (`-d @body.json`, 
   skipped. Everything is read locally, cached for a day in `~/.egress-guard/`, and never sent anywhere.
 - `EGRESS_GUARD_HOME` moves the whole folder (identity, cache, log).
 
-### Look-alike spellings and contact fields (0.2.0)
+### Allow lists, questions and session exceptions (0.2.x)
 
-Exact matches of your identity are **denied**. Two further checks **ask** you first (Claude Code shows a permission
-prompt), because they can be wrong:
+```json
+{"emails": ["you@your-mail.com"], "names": ["First Last"],
+ "allow_emails": ["agents@your-domain.com"],
+ "allow_hosts": ["github.com", "wordpress.org"]}
+```
 
-- `fuzzy` (`"ask"` default, `"deny"`, `"off"`): other ways to write the same thing, not encodings. Unicode look-alikes
-  (Cyrillic/Greek letters, full-width, zero-width characters; these are treated as exact and denied), German/Polish
-  transliteration (Müller / Mueller, Schmidt / Szmit, Christian / Krystian), digits for letters (Mu11er) and one typo
-  (two for long names). Applies to `names`, `emails` and `extra`. A surname with another first name in front of it
-  ("Anna Miller" when you are "Jan Miller") is someone else and passes.
-- `contact_fields` (`"ask"` default, `"deny"`, `"off"`): **any** e-mail address, not only yours, in a field whose job
-  is to say who is calling: User-Agent (`-A`, `--user-agent`, `User-Agent:`), `From:`, `X-Contact`, `git -c
-  user.email`, `email=` / `contact=` parameters. Sites such as SEC EDGAR ask for a contact in the User-Agent, and an
-  agent fills it with the address it knows: yours. `contact_alias: ["agents@your-domain.com"]` lists addresses
-  agents may use there; placeholders (`@example.com`, noreply) pass.
+- `allow_emails`: addresses agents may send anywhere without asking (User-Agent, From, forms). Never list your
+  private address here. A block message names these addresses, so the agent can switch to one of them.
+- `allow_hosts`: sites where your identity may go. WebFetch and MCP calls (browser navigation included) to them
+  pass; a shell command to them **asks** instead of blocking, because a shell line can name an allowed host and send
+  elsewhere.
+- Exact matches of your identity are **denied**, in every tool the hook sees, browser MCP tools included (a browser
+  `type` call carries no URL, so typing your private address into a form is denied: use an `allow_emails` address).
+- Two checks **ask** (Claude Code shows a permission prompt) because they can be wrong:
+  - `fuzzy` (`"ask"` default, `"deny"`, `"off"`): other ways to write the same thing, not encodings: Unicode
+    look-alikes and zero-width characters (treated as exact and denied), German/Polish transliteration
+    (Müller / Mueller, Schmidt / Szmit, Christian / Krystian), digits for letters (Mu11er), one or two typos, also
+    in URL-decoded and base64 forms. Applies to `names`, `emails` and `extra`. "Anna Miller" when you are
+    "Jan Miller" is someone else and passes.
+  - `contact_fields` (`"ask"` default, `"deny"`, `"off"`): **any** e-mail address, not only yours, in a field whose
+    job is to say who is calling: User-Agent (`-A`, `--user-agent`, `User-Agent:`), `From:`, `X-Contact`,
+    `git -c user.email`, `email=` / `contact=` parameters. Sites such as SEC EDGAR ask for a contact in the
+    User-Agent and an agent fills it with the address it knows: yours.
 - `first_alone` (default `false`): also ask about your first name on its own (useful for a rare first name).
-- `scan_browser` (default `false`): browser tools (Playwright, Chrome MCP) are not scanned. Typing your data into a
-  form you asked the agent to fill is deliberate; tools that run page scripts (`evaluate`, `javascript`) are still
-  scanned.
+- **Escalation, without any server:** every block or question tells the agent to stop, tell you what it wants to
+  send, where and why, and hand you the exact command that approves it for this session only, for example
+  `! whoami-guard-allow --host data.sec.gov`.
+- **Session exceptions** (`whoami-guard-allow`, run by you inside the agent session with the `!` prefix, which Claude
+  Code runs outside the hooks): `--email ADDR` / `--host HOST` add to the allow lists for this session only;
+  no list means questions instead of blocks; `--off` turns checks off; a number sets the hours (default 2);
+  `--list`, `--clear`. "This session" is the session of the last tool call the hook saw; the command prints its
+  folder. The hook denies agent tool calls that run this command, set `EGRESS_GUARD_*` variables or write into the
+  whoami-guard folder, so an agent cannot grant itself an exception.
+- Per terminal: `EGRESS_GUARD_MODE=ask` (questions instead of blocks) or `off`, set before starting the agent.
+- **Codex** has no "ask": add `--codex` to the hook command there and every question becomes a block.
 
-Measured: on the gate set recall 0.994 -> 0.997 with the same 3 false alarms as 0.1.1 (the fuzzy check added none;
-40 rows that put someone else's address in a User-Agent now ask by design and are counted apart). Replaying 73,830
-tool calls from the author's own Claude Code transcripts: 0 fuzzy questions, 24 contact-field questions. Ciphers
-(rot13, hex, a custom code) are out of scope: a pattern matcher cannot stop an agent that tries to hide.
+Measured: gate set recall 0.994 -> 0.997 with the same 3 false alarms as 0.1.1 (40 rows that put someone else's
+address in a User-Agent now ask by design and are counted apart). Replaying the hooked tool calls (Bash, WebFetch,
+Write, Edit, MCP) from the author's own Claude Code transcripts (73,967 tool calls in all): 4 fuzzy questions,
+29 contact-field questions. Ciphers (rot13, hex, a custom code) are out of scope: a pattern matcher cannot stop an
+agent that hides.
 
 ## Known gaps and limits
 
@@ -205,7 +224,7 @@ python -I bench/heldout.py <tag>
   author = {Schutz, Chrystian},
   title  = {whoami-guard: an identity-aware egress hook for coding agents},
   year   = {2026},
-  version = {0.2.0},
+  version = {0.2.1},
   url    = {https://github.com/ChrystianSchutz/whoami-guard}
 }
 ```

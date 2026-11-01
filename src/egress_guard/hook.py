@@ -16,12 +16,14 @@ import re
 import subprocess  # nosec B404
 import sys
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from egress_guard.scan import ASK_KINDS, Identity, scan_tool_call
 
 HOME = Path(os.environ.get("EGRESS_GUARD_HOME", Path.home() / ".egress-guard"))
+CODEX = "--codex" in sys.argv  # Codex hook command: findings that would ask are denied (Codex has no "ask")
 REASON = ("whoami-guard blocked this call: it would send the user's own {kinds} to an outside service. Personal "
           "data from your context (account e-mail, name) must never go into requests, headers, URLs or bodies, even "
           "when a site asks for contact details. Use a generic identifier without personal data (for example "
@@ -30,7 +32,7 @@ REASON = ("whoami-guard blocked this call: it would send the user's own {kinds} 
 ASK_REASON = ("whoami-guard: this call may send personal data to an outside service ({kinds}: a look-alike form of "
               "the user's identity, or an e-mail address in a User-Agent / From / contact field). Approve only if you "
               "meant to send it. Agents: do not put any e-mail address in a User-Agent or contact header unless the "
-              "user gave you one for that purpose (contact_alias); use a generic identifier instead.")
+              "user listed it in allow_emails; use a generic identifier instead.")
 
 
 def _git(key: str) -> str:
@@ -51,8 +53,8 @@ def load_identity() -> tuple[Identity, bool]:
                      extra=list(cfg.get("extra", [])), allow_hosts=list(cfg.get("allow_hosts", [])),
                      ignore=list(cfg.get("ignore", [])), fuzzy=str(cfg.get("fuzzy", "ask")),
                      contact_fields=str(cfg.get("contact_fields", "ask")),
-                     contact_alias=list(cfg.get("contact_alias", [])), first_alone=bool(cfg.get("first_alone", False)),
-                     scan_browser=bool(cfg.get("scan_browser", False)))
+                     allow_emails=list(cfg.get("allow_emails", [])) + list(cfg.get("contact_alias", [])), first_alone=bool(cfg.get("first_alone", False)),
+                     )
     if cfg.get("autodetect", True):
         found = _autodetect()
         for e in found["emails"]:
@@ -140,23 +142,113 @@ def _claude_email() -> str:
         return ""
 
 
+SELF_REASON = ("whoami-guard: only the user may change whoami-guard's settings or exceptions (identity.json, "
+               "sessions.json, whoami-guard-allow). Ask the user; they can run `! whoami-guard-allow` in this session.")
+# the agent must not grant itself an exception: shell commands that name the control files or the allow command,
+# and file tools that write into the whoami-guard folder, are denied (the user's own `!` commands are not hooked)
+# Only real attempts count: running the allow command, setting an EGRESS_GUARD_* variable, or a write, copy, move or
+# delete that names the whoami-guard folder. A command that merely mentions them (docs, grep, reading the log) passes
+# (the broad 0.2.1 draft blocked the author's own doc edits, 2026-11-01).
+_CONTROL = re.compile(
+    r"(?:^|[\n;&|(`]|\b(?:sudo|env|exec|then|do)\s)\s*whoami-guard-allow\b"
+    r"|\begress_guard\.allow\b"
+    r"|(?:\bexport\s+|\$env:|\bset\s+|\bsetx\s+|(?:^|[\s;&|])(?=EGRESS_GUARD_))EGRESS_GUARD_\w+\s*="
+    r"|(?:>>?|\btee\b|\bcp\b|\bmv\b|\brm\b|\bln\b|\bsed\s+-i|\bperl\s+-[a-z]*i|\btruncate\b|\bdd\b|"
+    r"Set-Content|Add-Content|Out-File|Remove-Item|New-Item|Copy-Item|Move-Item|Rename-Item|\.write_text|"
+    r"\.write\(|open\([^)]*['\"][wa])[^\n;&|]*\.egress-guard",
+    re.IGNORECASE)
+
+
+def _touches_controls(event: dict) -> bool:
+    tool, inp = event.get("tool_name", ""), event.get("tool_input") or {}
+    if not isinstance(inp, dict):
+        return False
+    if tool in ("Bash", "PowerShell", "exec_command", "shell"):
+        return any(_CONTROL.search(v) for v in inp.values() if isinstance(v, str))
+    path = str(inp.get("file_path") or inp.get("path") or inp.get("notebook_path") or "")
+    if path:
+        try:
+            p = Path(path).expanduser().resolve()
+            return p == HOME.resolve() or HOME.resolve() in p.parents
+        except (OSError, ValueError):
+            return True
+    return False
+
+
+def session_rec(session_id: str) -> dict:
+    """The user's running exception for this session (whoami-guard-allow): mode ('ask' / 'off' / ''), and extra
+    allowed e-mails and hosts for this session only; {} when there is none or it expired."""
+    if not session_id:
+        return {}
+    try:
+        rec = json.loads((HOME / "sessions.json").read_text(encoding="utf-8")).get(session_id) or {}
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return rec if isinstance(rec, dict) and float(rec.get("until", 0)) > time.time() else {}
+
+
+_HOST = re.compile(r"https?://(?:[^/\s'\"@]*@)?([A-Za-z0-9.-]+)", re.IGNORECASE)
+
+
+def _hosts(event: dict) -> list[str]:
+    text = json.dumps(event.get("tool_input") or {})
+    return list(dict.fromkeys(h.lower().rstrip(".") for h in _HOST.findall(text)))[:3]
+
+
+def _escalation(ident: Identity, event: dict) -> str:
+    """What the agent should do next: use an approved address, or ask the user with a reason and the exact command
+    that approves it (a standalone escalation; nothing is sent anywhere)."""
+    out = ""
+    if ident.allow_emails:
+        out += (" Addresses the user approved for agents (use one of them instead): "
+                + ", ".join(ident.allow_emails[:5]) + ".")
+    hosts = _hosts(event)
+    cmd = " ".join(f"--host {h}" for h in hosts) or "--email <address>"
+    out += (" If sending this is really needed for the user's task, stop and ask the user: say what you want to send, "
+            "to which site and why, and give them this command to approve it for this session only: "
+            f"`! whoami-guard-allow {cmd}`. Do not retry with the data rewritten or encoded.")
+    return out
+
+
 def decide(event: dict, ident: Identity, strict: bool) -> dict:
     t0 = time.perf_counter()
+    if _touches_controls(event):
+        _log({"ts": time.time(), "tool": event.get("tool_name"), "blocked": True, "kinds": ["self-protection"]})
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": SELF_REASON}}
+    sid = str(event.get("session_id") or "")
+    rec = session_rec(sid)
+    if rec.get("emails") or rec.get("hosts"):
+        ident = replace(ident, allow_emails=ident.allow_emails + list(rec.get("emails", [])),
+                        allow_hosts=ident.allow_hosts + list(rec.get("hosts", [])))
     found = scan_tool_call(event.get("tool_name", ""), event.get("tool_input", {}), ident, strict,
                            cwd=event.get("cwd"))
     kinds = sorted({f.kind for f in found})
+    # session id and folder name (no personal data) so `whoami-guard-allow` can find the session it is run in
     _log({"ts": time.time(), "tool": event.get("tool_name"), "blocked": bool(found), "kinds": kinds,
+          "session": sid, "folder": Path(str(event.get("cwd") or "")).name,
           "ms": round((time.perf_counter() - t0) * 1000, 3)})
     if not found:
         return {}
-    hard = [k for k in kinds if k not in ASK_KINDS or
+    mode = str(rec.get("mode") or "") or os.environ.get("EGRESS_GUARD_MODE", "").strip().lower()
+    if mode == "off":
+        return {}  # the user's exception: one terminal (env) or one session (whoami-guard-allow)
+    hard = [k for k in kinds if "@" not in k and (  # "kind@host": an allowed host in a shell line, ask
+            k not in ASK_KINDS or
             (k == "contact-email" and ident.contact_fields == "deny") or
-            (k != "contact-email" and ident.fuzzy == "deny")]
+            (k != "contact-email" and ident.fuzzy == "deny"))]
+    if mode == "ask":
+        hard = []
+    if CODEX or os.environ.get("EGRESS_GUARD_AGENT", "").strip().lower() == "codex":
+        # Codex treats "ask" as an unsupported result and runs the tool (Sol review 2026-11-01): deny there
+        hard = hard or kinds
     if hard:
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                       "permissionDecisionReason": REASON.format(kinds=", ".join(kinds))}}
+                                       "permissionDecisionReason": REASON.format(kinds=", ".join(kinds))
+                                       + _escalation(ident, event)}}
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
-                                   "permissionDecisionReason": ASK_REASON.format(kinds=", ".join(kinds))}}
+                                   "permissionDecisionReason": ASK_REASON.format(kinds=", ".join(kinds))
+                                   + _escalation(ident, event)}}
 
 
 def _log(rec: dict) -> None:

@@ -9,7 +9,7 @@ import binascii
 import html
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import unquote_plus, urlsplit
 
@@ -159,9 +159,9 @@ class Identity:
     # 0.2.0: look-alike spellings and e-mails in contact fields; "ask" (the user decides), "deny" or "off"
     fuzzy: str = "ask"
     contact_fields: str = "ask"
-    contact_alias: list[str] = field(default_factory=list)  # addresses agents may put in a User-Agent / From
+    # addresses agents may send without asking (User-Agent, From, forms); never list your private address here
+    allow_emails: list[str] = field(default_factory=list)
     first_alone: bool = False  # also ask about the first name on its own (useful for a rare first name)
-    scan_browser: bool = False  # browser tools (Playwright, Chrome): filling a form with your data is your call
 
     def needles(self) -> list[tuple[str, str, str]]:
         """(kind, folded needle, squashed needle) for every form we look for."""
@@ -345,9 +345,6 @@ def safe_ignore(ident: Identity) -> list[str]:
 def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = False,
                    cwd: str | None = None) -> list[Finding]:
     """Findings for one PreToolUse event (Claude Code and Codex send the same tool_name / tool_input shape)."""
-    if tool_name.startswith("mcp__") and BROWSER.search(tool_name) and not BROWSER_CODE.search(tool_name) and \
-            not ident.scan_browser:
-        return []  # clicking and typing in a browser is visible and deliberate; running page scripts is not
     texts = strings_of(tool_input)
     joined = "\n".join(texts)
     if isinstance(tool_input, dict) and isinstance(tool_input.get("workdir"), str):
@@ -368,9 +365,14 @@ def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = F
         code = joined + "\n" + _file_text(tool_input)
         if not NETWORK_CODE.search(code):
             return []
-    if ident.allow_hosts and host_allowed(joined, ident.allow_hosts) and \
-            tool_name not in SHELL_TOOLS:
+    host_ok = bool(ident.allow_hosts) and host_allowed(joined, ident.allow_hosts)
+    if host_ok and tool_name not in SHELL_TOOLS:
         return []
+    if host_ok:
+        # a shell line can name an allowed host and still send elsewhere (pipes, substitutions, git host:path;
+        # release review 2026-10-30), so an allowed host in a shell command turns a block into a question
+        return [Finding(f.kind + "@host", f.needle, f.where)
+                for f in scan_tool_call(tool_name, tool_input, replace(ident, allow_hosts=[]), strict, cwd)]
     needles = ident.needles()
     ignore = safe_ignore(ident)
     cut = re.compile("|".join(re.escape(x) for x in ignore), re.IGNORECASE) if ignore else None
@@ -389,10 +391,11 @@ def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = F
     for t in texts:
         extra = []
         if ident.fuzzy != "off":
-            extra += fuzzy_hits(cut.sub(" ", t) if cut else t, ident.emails, ident.names,
-                                ident.first_alone, ident.extra, ident.derived_names)
+            for v in dict.fromkeys(views(cut.sub(" ", t) if cut else t)):  # also URL-decoded, base64, "at"/"dot"
+                extra += fuzzy_hits(v, ident.emails, ident.names, ident.first_alone, ident.extra,
+                                    ident.derived_names)
         if ident.contact_fields != "off":
-            extra += contact_hits(t, ident.contact_alias)
+            extra += contact_hits(t, ident.allow_emails)
         for kind, what in extra:
             if (kind, what) not in seen:
                 seen.add((kind, what))
@@ -402,5 +405,4 @@ def scan_tool_call(tool_name: str, tool_input, ident: Identity, strict: bool = F
 
 # findings that are a question for the user (by default), not a hard block
 ASK_KINDS = {"name-fuzzy", "surname-fuzzy", "first-fuzzy", "email-fuzzy", "extra-fuzzy", "contact-email"}
-BROWSER = re.compile(r"playwright|puppeteer|chrome|browser|selenium", re.IGNORECASE)
-BROWSER_CODE = re.compile(r"javascript|evaluate|run_code|execute|script", re.IGNORECASE)
+

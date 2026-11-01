@@ -14,7 +14,7 @@ No ciphers: something built to hide (rot13, hex, a custom code) is out of scope 
 """
 import re
 import unicodedata
-from urllib.parse import unquote_plus
+from urllib.parse import unquote
 
 # letters that look like Latin ones (Cyrillic, Greek); NFKC already maps full-width and mathematical letters
 _CONFUSABLE = str.maketrans({
@@ -83,11 +83,15 @@ def _budget(n: int) -> int:
     return 0 if n < 5 else 1 if n < 9 else 2
 
 
-def close(token_key: str, part_key: str, inflect: int = 0) -> bool:
-    """The token is the name part, maybe with typos, maybe with up to `inflect` letters of a case ending."""
+def close(token_key: str, part_key: str, inflect: int = 0, raw_len: int = 0) -> bool:
+    """The token is the name part, maybe with typos, maybe with up to `inflect` letters of a case ending. The typo
+    budget follows the longer of the sound key and the written word (raw_len): 'Schmidt' has the key 'smit' but is
+    a 7-letter name, so 'Schmdt' (one deletion) still counts (Sol review 2026-11-01)."""
     if not part_key or len(token_key) < 3:
         return False
-    b = _budget(len(part_key))
+    # ...but never more typos than letters beyond 3 in the key: a 3-letter key with one typo matches ordinary
+    # words (replay of 74k real tool calls, 2026-11-01: 3,848 false questions)
+    b = min(_budget(max(len(part_key), raw_len)), max(0, len(part_key) - 3))
     if token_key != part_key and token_key.startswith(part_key):
         # the word plus an ending ('Desktops', 'Users'): an inflection, not a typo; only where endings are allowed
         return inflect > 0 and len(part_key) >= 5 and len(token_key) - len(part_key) <= inflect
@@ -120,12 +124,39 @@ def words(text: str) -> list[tuple[str, str]]:
     return out
 
 
-EMAIL = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)*\.[A-Za-z]{2,}")
+_LOCAL_CH = re.compile(r"[\w.+-]")
+_DOMAIN = re.compile(r"[\w-]{1,63}(?:\.[\w-]{1,63}){1,8}")
+_TLD = re.compile(r"[A-Za-z]{2,}")
 
 
-def _email_key(e: str) -> str:
+def find_emails(text: str) -> list[str]:
+    """E-mail addresses in the text. Linear: the old single regex backtracked on long runs without a valid domain
+    (a 100 KB User-Agent took 54 s, over the hook timeout; Sol review 2026-11-01). Each '@' is expanded by at most 64
+    characters to the left and by one bounded domain match to the right."""
+    out = []
+    for m in re.finditer("@", text):
+        a = m.start()
+        i = a
+        while i > 0 and a - i < 64 and _LOCAL_CH.match(text, i - 1):
+            i -= 1
+        local = text[i:a].lstrip(".")
+        d = _DOMAIN.match(text, a + 1, min(len(text), a + 1 + 253))
+        if not local or not d:
+            continue
+        labels = d.group(0).split(".")
+        while len(labels) > 1 and not _TLD.fullmatch(labels[-1]):
+            labels.pop()  # 'x@corp.io.123' -> corp.io
+        if len(labels) > 1:
+            out.append(local + "@" + ".".join(labels))
+    return out
+
+
+def _email_key(e: str, leet: bool = False) -> str:
+    """Address for comparing look-alikes: no look-alike letters, lower case, plus-tag and punctuation of the local
+    part dropped; with `leet`, digits read as letters (mu11er@ -> muller@)."""
     local, _, domain = clean(e).lower().partition("@")
-    return re.sub(r"[._+-]", "", local.split("+", 1)[0]) + "@" + domain
+    local = re.sub(r"[._+-]", "", local.split("+", 1)[0])
+    return (local.translate(_LEET) if leet else local) + "@" + domain
 
 
 def fuzzy_hits(text: str, emails: list[str], names: list[str], first_alone: bool = False,
@@ -147,33 +178,35 @@ def fuzzy_hits(text: str, emails: list[str], names: list[str], first_alone: bool
         if len(parts) < 2:
             continue
         fk, lk = key(parts[0]), key(parts[-1])
+        fn, ln = len(clean(parts[0])), len(clean(parts[-1]))
         for i, (w, k) in enumerate(ws):
             nxt = ws[i + 1][1] if i + 1 < len(ws) else ""
-            if (close(k, fk, 3) and close(nxt, lk, 4)) or (close(k, lk, 4) and close(nxt, fk, 3)):
+            if (close(k, fk, 3, fn) and close(nxt, lk, 4, ln)) or (close(k, lk, 4, ln) and close(nxt, fk, 3, fn)):
                 out.append(("name-fuzzy", f"{w} {ws[i + 1][0]}"))
                 break
         else:
             if n not in names:
                 continue  # a guessed name (from a first.last@ address) counts only as the full name
             for i, (w, k) in enumerate(ws):
-                if len(lk) >= 5 and close(k, lk, 4):
+                if max(len(lk), ln) >= 5 and close(k, lk, 4, ln):
                     prev = ws[i - 1][0] if i else ""
                     # 'Anna Miller' is someone else; the user's own first name (or a typo of it) before it is not
-                    if prev[:1].isupper() and prev[1:].islower() and len(prev) >= 3 and not close(key(prev), fk, 3):
+                    if prev[:1].isupper() and prev[1:].islower() and len(prev) >= 3 and \
+                            not close(key(prev), fk, 3, fn):
                         continue
                     out.append(("surname-fuzzy", w))
                     break
-                if first_alone and len(fk) >= 6 and close(k, fk, 3):
+                if first_alone and max(len(fk), fn) >= 6 and close(k, fk, 3, fn):
                     out.append(("first-fuzzy", w))
                     break
-    mine = {_email_key(e) for e in emails if "@" in e}
+    mine = {_email_key(e, leet=True) for e in emails if "@" in e}
+    plain = {_email_key(e) for e in emails if "@" in e}
     if mine:
-        cleaned = clean(text)
-        for found in EMAIL.findall(cleaned):
-            fk_ = _email_key(found)
+        for found in find_emails(clean(text)):
+            fk_ = _email_key(found, leet=True)
             if fk_ in mine:
-                if found not in text:  # exact only after look-alikes were replaced: 'jаn@x.pl' with a Cyrillic а
-                    out.append(("email-fuzzy", found))
+                if found not in text or _email_key(found) not in plain:
+                    out.append(("email-fuzzy", found))  # look-alike letters, or digits for letters (mu11er@)
                 continue
             fl, fd = fk_.split("@", 1)
             for m in mine:
@@ -187,22 +220,25 @@ def fuzzy_hits(text: str, emails: list[str], names: list[str], first_alone: bool
 
 # fields whose job is to identify the caller
 _FIELD = re.compile(
-    r"""(?:(?<!\S)(?:-A|--user-agent)(?:\s+|=)(?:"([^"]*)"|'([^']*)'|(\S+)))"""
-    r"""|(?:\b(?:user[-_]agent|from|x-contact|x-email|contact)["']?\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^\s"',}]+)))"""
+    r"""(?:(?<!\S)(?:-A|--user-agent)(?:\s+|=)?(?:"([^"]*)"|'([^']*)'|(\S+)))"""
+    # header and dict values: quoted, or unquoted up to the end of the enclosing shell argument or line
+    # (-H "User-Agent: bot x@y.com", http x.org 'From:Name <x@y.com>'; Sol review 2026-11-01)
+    r"""|(?:\b(?:user[-_]agent|from|x-contact|x-email|contact)["']?\s*[:=]\s*(?:"([^"]*)"|'([^']*)'|([^"'\n}]+)))"""
     r"""|(?:\buser\.email\s*=\s*(?:"([^"]*)"|'([^']*)'|(\S+)))"""
     r"""|(?:[?&](?:e-?mail|mail|contact|from)=([^&\s"']+))""",
     re.IGNORECASE)
-_PLACEHOLDER = re.compile(r"(?i)@(?:[\w-]+\.)*(?:example\.(?:com|org|net)|example|invalid|test|localhost)$|noreply")
+_PLACEHOLDER = re.compile(r"(?i)@(?:[\w-]+\.)*(?:example\.(?:com|org|net)|example|invalid|test|localhost)$"
+                          r"|^(?:no-?reply|do-?not-?reply)@|@users\.noreply\.github\.com$")
 
 
 def contact_hits(text: str, alias: list[str]) -> list[tuple[str, str]]:
     """E-mail addresses (anyone's) in User-Agent, From, contact headers, git user.email or e-mail URL parameters."""
-    allowed = {_email_key(a) for a in alias if "@" in a}
+    allowed = {clean(a).strip().lower() for a in alias if "@" in a}  # exact addresses only: agent.s@ is not agents@
     out = []
     for m in _FIELD.finditer(text):
-        val = unquote_plus(next((g for g in m.groups() if g is not None), ""))
-        for e in EMAIL.findall(clean(val)):
-            if _email_key(e) in allowed or _PLACEHOLDER.search(e):
+        val = unquote(next((g for g in m.groups() if g is not None), ""))
+        for e in find_emails(clean(val)):
+            if e.lower() in allowed or _PLACEHOLDER.search(e):
                 continue
             out.append(("contact-email", e))
     return out
