@@ -1,5 +1,81 @@
 # Changelog
 
+## 0.2.3 (2026-11-09)
+
+**The approval command in block messages works as printed**, whatever the user's PATH:
+
+- It is `<python> <package>/egress_guard/allow.py ...`: the Python and the package that run the hook, with full
+  paths, so it works for uv tool, pipx, venv, uvx and `contrib/run_hook.py` installs alike. The bare
+  `whoami-guard-allow` was "command not found" when the user's shell had another PATH than the agent (always for a
+  `run_hook.py` install, which puts no command on PATH). `allow.py` now runs as a file.
+- It is quoted for POSIX shells (Claude Code's `!` runs bash, also Git Bash on Windows; bash/zsh on macOS and
+  Linux); on Windows the message adds a PowerShell form with `&`.
+- It suggests the exception that really unblocks the call: `--host` for the sites in it (all of them, up to 12,
+  leaving out allowed ones; it named only the first 3), `--email` only for someone else's address in a contact field
+  (the user's own address and name have no allow list), `1 --ask` otherwise, and `1 --off` under Codex, which has
+  no questions.
+- Placeholders are `ID` / `ADDRESS`, not `<id>`, which bash reads as a redirect.
+- `--list` also shows recent session ids, and a wrong `--session` lists them.
+- `contrib/run_hook.py allow ...` runs the allow command from the pinned copy.
+
+**Issue #1** (thanks to @mattabate): in the default mode `gh issue|pr|gist|release|repo|discussion|...` are
+network commands like `gh api`, also with options before the subcommand (`gh --repo o/r issue create`), so an
+e-mail or name in an issue body, PR comment or gist is checked. So are `npm|pnpm|yarn|bun|cargo publish`,
+`docker|podman push`, `twine upload` and `gem push`, also as `npm.cmd`. The owner part of the parsed `-R` /
+`--repo` argument of a gh command (the user's own GitHub account) does not count as a name; the posted text is
+checked whole, also when it quotes a gh command.
+
+**Fixes from the third Sol review** (gpt-6-sol, Not OK, 2 P1 + 4 P2, all confirmed):
+
+- Self-protection compares the whoami-guard hook groups before and after a settings edit: narrowing the matcher,
+  moving the hook to another event, `"disableAllHooks": true` or settings that no longer parse are denied, not only
+  removing the hook's name. `$(whoami-guard-allow --off)`, backticks and `<( )` inside a reading command are denied.
+- An allowed URL exempts a non-shell call only when the call's single destination is its `url`: WebFetch
+  `{url, prompt}` or a browser navigate `{url}`. Evaluate calls, a `host` or `to` field beside the url and other
+  shapes get the full scan. A file is exempt only when every URL, quoted host name and IP in it is allowed and it
+  builds no other destination.
+- A block without a session id prints `--session ID`, and `whoami-guard-allow` without `--session` refuses after
+  such a block instead of picking the newest session.
+- `"until": "nan"` / `inf` in `sessions.json` grants nothing (it granted `off` forever).
+- Read / Glob / Grep of the whoami-guard folder pass; only writes are self-protection.
+
+**Fixes from the Astra review of this release** (gpt-6-astra, round 4, Not OK, 6 P1 + 2 P2, all confirmed and
+fixed before release): sed option forms (`--in-place`, `-e'...'`, options after operands, `w` / `e` commands),
+`127.sink.test` and protocol-relative URLs passing as local, a quoted gh command in a posted body losing the name
+check, MCP fields beside an allowed url, `package.json` scripts with curl, `gh --repo o/r issue create`,
+PowerShell / metacharacter quoting of the approval command, and an exception Codex can use. Also: Codex
+`config.toml` hook groups are compared parsed (a narrowed matcher line holds no "hook"), apply_patch denies any
+changed hook or matcher line, and an 8 MB command of thousands of `;` segments is checked in about 2 s instead of
+54 s (a hook past its timeout lets the call through).
+
+**Round 5** (Not OK, 5 P1 + 1 P2, all confirmed and fixed): the local / allowed-host proof also reads hosts with a
+trailing dot, Unicode and ideographic dots, numeric hosts and pieces glued by formatting (`'%s.test'`,
+`f'{h}.test'`, `'sink' '.test'`, `.replace(..., '.')`, `chr`); the repo owner is cut only from shell commands and
+never from an option's value (`--body -RJanKowalski/x`); inline code in data files counts (`node -e "fetch(...)"`
+in package.json scripts, `python -c` in CI); gh / git / package commands are read token by token in one pass
+(16,000 repeated `gh` took over 12 s, now milliseconds); apply_patch denies `*** Move to:` of the settings and moves
+onto them; `--host` is suggested only when the scanner then lets the call through. `sed -n '/.egress-guard/p'` and
+other print-only sed scripts pass.
+
+**Round 6** (Not OK, 5 P1 + 1 P2, all confirmed and fixed): numeric hosts in every inet_aton form (`'8.8'`,
+`'0x8.0x8.0x8.0x8'`, `'134744072'`) and hosts ended by an escape (`'sink.test\n'.strip()`) get no local exemption;
+boolean gh flags (`--draft`, `--web`, `--comments`) take no value, so `--draft --body -RJanKowalski/x` keeps the
+name check and `gh pr view --comments -R <you>/repo` passes; data files count imported calls
+(`from requests import post`), interpreter heredocs (`python <<'PY'`) and commands inside JSON strings
+(`"postinstall": "gh issue create ..."`); deeply nested settings deny instead of crashing the hook, and any scanner
+error denies the call; the URL, sed and spelled-out `at` / `dot` patterns stay linear on adversarial 50 KB inputs
+(they took 5-34 s; the last two also in 0.2.2).
+
+**Fewer false blocks** (all seen in one working day):
+
+- Data files (`.yaml .yml .json .toml .ini .cfg .xml`) count as outbound only when they hold a User-Agent or a
+  command that sends (curl, gh, git push, publish ...): a CV in YAML listing "WebSocket, gRPC" among skills was
+  blocked.
+- Code whose only destinations are this machine (`localhost`, loopback IPs) and that builds no other one is local:
+  a PDF generator opening `http://localhost:4173` was blocked.
+- `sed` that only reads, and `sed -i` on a file that is not a control (a plain `s` script that merely mentions the
+  whoami-guard folder) pass; the agent may run `whoami-guard-allow --list` / `--help`.
+
 ## 0.2.2 (2026-11-01)
 
 Fixes from the second Sol review (gpt-6.1-sol, Not OK, 6 findings, all confirmed):

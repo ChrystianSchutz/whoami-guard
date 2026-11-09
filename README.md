@@ -53,9 +53,9 @@ uv tool install whoami-guard
 uv tool update-shell   # only if the commands are not found in a new terminal
 ```
 
-No install at all: point the hook at `uvx --from whoami-guard==0.2.2 whoami-guard-hook`. uv downloads and caches
-it on first use; pinning the version keeps the hook from changing under you. Approve a one-off exception the
-same way: `uvx --from whoami-guard whoami-guard-allow --host example.com`.
+No install at all: point the hook at `uvx --from whoami-guard==0.2.3 whoami-guard-hook` (for Codex add
+`--codex` at the end). uv downloads and caches it on first use; pinning the version keeps the hook from changing
+under you. Approve a one-off exception the same way: `uvx --from whoami-guard whoami-guard-allow --host example.com`.
 
 Other ways:
 
@@ -74,6 +74,8 @@ interpreter, in the hook settings below.
 pipx, as above), or use the launcher in [`contrib/run_hook.py`](contrib/run_hook.py): copy it to
 `~/.egress-guard/run_hook.py`, copy `src/egress_guard/` to `~/.egress-guard/pkg/egress_guard/`, and run
 `python -I ~/.egress-guard/run_hook.py` (absolute path on Windows). That also pins the version the hook runs.
+This install puts no `whoami-guard-allow` on PATH: run exceptions as `python ~/.egress-guard/run_hook.py allow ...`
+or copy the command from the block message (full paths, works in any shell).
 
 Check the install with one allowed and one denied event (the second line must print a `deny` decision):
 
@@ -175,17 +177,23 @@ The shim also reads request bodies and headers given as files (`-d @body.json`, 
 - `first_alone` (default `false`): also ask about your first name on its own (useful for a rare first name).
 - **Escalation, without any server:** every block or question tells the agent to stop, tell you what it wants to
   send, where and why, and hand you the exact command that approves it for this session only, for example
-  `! whoami-guard-allow --host data.sec.gov`.
+  `! /usr/bin/python3 /home/you/.local/share/uv/tools/whoami-guard/lib/python3.12/site-packages/egress_guard/allow.py
+  --host data.sec.gov --session 3f2a9c1e`. It names the Python and package that run the hook with full paths, so it
+  runs as is whatever your PATH is (POSIX-quoted for bash/zsh and Claude Code's `!`; on Windows a PowerShell form
+  follows). It picks the exception that unblocks that call: `--host` for the sites in it, `--email` for someone
+  else's address in a contact field, otherwise `1 --ask`, and `1 --off` under Codex, which has no questions.
 - **Session exceptions** (`whoami-guard-allow`, run by you inside the agent session with the `!` prefix, which Claude
   Code runs outside the hooks): `--email ADDR` / `--host HOST` add to the allow lists for this session only;
   no list means questions instead of blocks; `--off` turns checks off; a number sets the hours (default 2);
-  `--list`, `--clear`. The block message gives the exact command with `--session <id>` of the session that asked.
-  Without `--session` the command takes the session of the last tool call the hook saw and refuses when several
-  sessions were active in the last 10 minutes. Malformed exception files grant nothing and `--clear` always works.
+  `--list` (exceptions and recent session ids), `--clear`. The block message gives the exact command with
+  `--session` of the session that asked. Without `--session` the command takes the session of the last tool call
+  the hook saw and refuses when several sessions were active in the last 10 minutes, or when a call without a
+  session id was blocked. Malformed exception files grant nothing and `--clear` always works.
 - **Self-protection:** the hook denies agent shell commands that run the allow command (also quoted or by full
   path), set `EGRESS_GUARD_*` variables, write into the whoami-guard folder or the agent's hook settings, or run code
-  that names them (`python -c "...'.egress-guard'..."`), and file edits that remove the hook entry from
-  `~/.claude/settings.json` or `~/.codex/config.toml`. Commands that only read (grep, cat, ls, git log) pass. A script
+  that names them (`python -c "...'.egress-guard'..."`, `$(whoami-guard-allow --off)`), and file edits that change
+  the hook entry in `~/.claude/settings.json` or `~/.codex/config.toml` (removing it, narrowing its matcher, moving
+  it to another event, `disableAllHooks`). Commands that only read (grep, cat, sed -n, ls, git log) pass. A script
   written first and run later is not seen: this keeps a well-meaning agent from "fixing" a block by itself, it does
   not stop one that hides what it does.
 - Per terminal: `EGRESS_GUARD_MODE=ask` (questions instead of blocks) or `off`, set before starting the agent.
@@ -211,8 +219,20 @@ agent that hides.
   not scanned; set `"strict": true` to scan every call. A release review with Codex (9 rounds, 2026-10-30) found and
   closed a series of such forms (pipes, substitutions, git `host:path`, `git.exe`); expect more.
 - The guard errs toward blocking: a local write next to a network command, or a file named `socket.log`, can be
-  blocked although nothing is sent.
-- Hooks fail open by default in both agents (see `onFailure` above for Claude Code).
+  blocked although nothing is sent. Data files (YAML, JSON, TOML, ...) and code that only talks to `localhost` are
+  treated as local, so a script that reads such a file and sends it elsewhere at run time is outside its view.
+- Tool calls of several MB take seconds to check (8 MB: about 1.5-2.5 s), under the 10 s hook timeout; the tests
+  run adversarial 50 KB inputs against the patterns, but a slow input that nobody has found yet is still possible.
+  Above 256 KB, or with more than 200 chained commands, a shell line is scanned whole: a local `git config` next to
+  a network command is then not left out (more blocks, never fewer).
+- An allowed host exempts only WebFetch and browser navigation to that URL, and files whose every destination is
+  allowed; any other MCP call is scanned as if nothing were allowed.
+- Code counts as local (or as talking only to allowed hosts) when every destination the scanner reads in it is;
+  code that glues hosts from pieces, escapes or decodes them gets the full scan. This is a proof by absence: each
+  review round found another way to write a host, so expect more. A host read at run time (environment, a file,
+  user input) is not visible to any hook.
+- Hooks fail open on a timeout in both agents (see `onFailure` above for Claude Code). If the scanner itself
+  raises an error, the hook denies the call and logs the error type.
 - A request to your own personal domain that contains your surname (`curl https://kowalczyk-studio.pl`) is flagged:
   these are the 2 false alarms on the benchmark's test split. Add the domain to `allow_hosts` (fetches) or `ignore` (folder names).
 - Name matching covers English and Polish inflection; other inflected languages are not tested.
@@ -250,7 +270,7 @@ python -I bench/heldout.py <tag>
   author = {Schutz, Chrystian},
   title  = {whoami-guard: an identity-aware egress hook for coding agents},
   year   = {2026},
-  version = {0.2.2},
+  version = {0.2.3},
   url    = {https://github.com/ChrystianSchutz/whoami-guard}
 }
 ```

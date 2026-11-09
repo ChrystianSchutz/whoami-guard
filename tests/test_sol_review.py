@@ -39,7 +39,7 @@ def test_browser_mcp_is_scanned_and_allow_lists_apply(tmp_path, monkeypatch):
     form = {"tool_name": "mcp__playwright__browser_type", "tool_input": {"text": "agents@corp.io"}}
     assert decision(form, ident) == "allow"
     out = hook.decide(nav, ident, False)["hookSpecificOutput"]["permissionDecisionReason"]
-    assert "agents@corp.io" in out and "whoami-guard-allow --host sink.org" in out
+    assert "agents@corp.io" in out and "allow.py --host sink.org" in out
 
 
 def test_codex_never_gets_ask(tmp_path, monkeypatch):
