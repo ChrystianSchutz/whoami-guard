@@ -1,5 +1,56 @@
 # Changelog
 
+## 0.2.4 (2026-11-24)
+
+**No AI co-author in your commits.** A shell `git commit` (also `--amend`, `commit-tree`, `tag`, `merge`, `am`,
+`cherry-pick`, `rebase`, `revert`, `notes`) whose message names an AI agent in a `Co-authored-by:` trailer, or
+that sets an AI vendor address or name as author or committer, is denied with a message that says what to remove.
+A `-F` / `--file` message file is read (64 KB). It does not depend on session exceptions (`--off` included); the
+variable `EGRESS_GUARD_AI_AUTHOR` set to `allow` in the user's environment turns it off. Why: Google's CLA bot
+failed a pull request on a `Co-authored-by: Claude <noreply@anthropic.com>` trailer after the human author had
+signed.
+
+**Approval memory: a question you approved is not asked again** in the same session for the same data in the same
+kind of call (Claude Code). Before, a session with an `--ask` exception asked again on every call that named, for
+example, your GitHub login in `gh pr create --head <login>:branch`, a minute after you approved the same.
+
+- Register the hook for **PostToolUse** too (same command and matcher, see the README). Claude Code sends that
+  event only for a call that really ran; when it is the very call the hook asked about (same session, same
+  tool_use_id, same content), its findings become approvals. Without the PostToolUse entry nothing changes.
+- An approval is keyed by the finding kind, the matched value and the call shape. MCP tools, web fetches and file
+  tools: the whole tool input word for word (another channel, recipient, URL or file asks again). Shell: only a
+  plain `gh` built-in command (`pr`, `issue`, `api`, `repo`, `gist`, `release`, `search`, `label`, `workflow`, `run`,
+  `discussion`, `project`), bound to that command group, the folder it runs in and the host gh will talk to
+  (`--hostname`, the HOST of `-R HOST/OWNER/REPO`, else a `GH_HOST` / `GH_REPO` the hook can see, else github.com;
+  a URL in `--body` is not a target). A shell line with anything that can change the target at run time (`$`,
+  backticks, redirections, pipes, chaining, globs, escapes, a bare `@file`, a whole URL as an argument, `-R` hidden
+  in a bundle of short flags), a gh alias or extension, and every other command, curl included, is never
+  remembered. gh options that read a file (`--body-file`, `-F`, `--input`) can change the content and, for
+  `gh api graphql --input`, the repository on the same host, but not the host, so they are remembered. gh refuses
+  aliases named like a built-in command, so `gh pr` is always gh's own. `GH_HOST` exported inside the agent's own
+  shell is not visible to the hook (known limit).
+- Only questions are remembered. A blocked call never runs, so a block never becomes an approval; exact matches
+  that were a question only because of an `--ask` exception count only while that exception runs.
+- Approvals end with the session exception (without one: after 2 hours) and with `whoami-guard-allow --clear`;
+  `--list` shows how many each session has. `--clear` writes a new revocation epoch into `sessions.json` (only
+  `whoami-guard-allow` writes that file), so approvals and open questions from before it count for nothing, also
+  ones a call still finishing writes back after the delete, and a question asked across the clear (the hook reads
+  the epoch once per decision). `whoami-guard-allow` changes `sessions.json` under a lock file
+  (`sessions.lock`, left-over locks expire after 30 s), so an exception command running next to `--clear` cannot
+  write old exceptions back; a locked or unwritable file is reported with exit 1, nothing changed. It says so when
+  it cannot delete the approvals file (revoked anyway). An unreadable `sessions.json` fails closed: no approval
+  counts until the next `whoami-guard-allow` writes a new epoch.
+- A convenience against repeat prompts, not an authentication of your answer: approvals live in `approvals.json` in
+  the whoami-guard folder as HMACs, never values, but the salt is in the same file, so an agent set on getting
+  around the guard can forge one (same limits as the rest of the self-protection). A malformed file grants nothing
+  and is replaced.
+- A malformed, deeply nested `sessions.json` no longer crashes the hook (it grants nothing).
+- Nothing is remembered in `bypassPermissions` / `dontAsk` mode (no question is shown there), under Codex (no
+  questions) or in the HTTP mode (any local process could post a fake PostToolUse to the port).
+- Self-protection: agent shell commands that run the hook itself (`whoami-guard-hook`, `python -m
+  egress_guard.hook`, `run_hook.py`, `from egress_guard import hook`) are denied, so an agent cannot pipe a fake
+  PostToolUse event into it. Reading those files still passes.
+
 ## 0.2.3 (2026-11-09)
 
 **The approval command in block messages works as printed**, whatever the user's PATH:
@@ -152,3 +203,7 @@ commands (`git ls-remote host:path`, `git://`, `git.exe`, global options).
 - Decision log with the matched kind only, never the value.
 - Synthetic benchmark (630 rows) with generator, independent held-out set (120 rows), gate thresholds, detector
   comparison script, and the real-harness reproduction (mock site, sandbox hook, runner, frozen-identity scorer).
+
+## 0.2.4 follow-up: owner-run control approvals
+
+Block messages tell the agent to paste the exact owner-run command into the conversation. Self-protection now supports `--control-once DIGEST --session ID`: one unchanged operation, one session, ten minutes, without disabling other checks. See [details](docs/control-once.md).

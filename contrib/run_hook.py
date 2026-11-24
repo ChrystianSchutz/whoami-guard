@@ -7,7 +7,8 @@ pinned copy of the package from the folder next to it instead:
     ~/.egress-guard/run_hook.py          (this file)
     ~/.egress-guard/pkg/egress_guard/    (copy of src/egress_guard/)
 
-Hook command:   python -I ~/.egress-guard/run_hook.py   (use the absolute path on Windows)
+Hook command:   python -I ~/.egress-guard/run_hook.py   (use the absolute path on Windows; register it for PreToolUse
+                and, for the approval memory, PostToolUse)
 Exceptions:     python ~/.egress-guard/run_hook.py allow --host example.com --session ID
                 (this install puts no `whoami-guard-allow` on PATH; block messages print this form with full paths)
 """

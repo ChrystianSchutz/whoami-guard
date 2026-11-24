@@ -108,7 +108,7 @@ def test_session_exceptions(tmp_path, monkeypatch):
     assert allow.main(["--clear"]) == 0
     assert decision(leak) == "deny"
     data = json.loads((tmp_path / "sessions.json").read_text())
-    assert data == {}
+    assert list(data) == [allow.EPOCH_KEY]  # no session left, only the revocation epoch (0.2.4)
 
 
 def test_agent_cannot_grant_itself_exceptions(tmp_path, monkeypatch):

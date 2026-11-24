@@ -10,10 +10,13 @@ Identity comes from ~/.egress-guard/identity.json ({"emails": [...], "names": [.
 verbatim, a git user.name that carries a machine label (not when every word is a label, e.g. "Admin User").
 Every decision is appended to ~/.egress-guard/log.jsonl with the matched KIND only, never the value.
 """
+import hashlib
+import hmac
 import json
 import math
 import os
 import re
+import secrets
 import shlex
 import subprocess  # nosec B404
 import sys
@@ -23,7 +26,7 @@ from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from egress_guard.scan import ASK_KINDS, FUZZY_MAX, Identity, scan_tool_call
+from egress_guard.scan import ASK_KINDS, FUZZY_MAX, SHELL_TOOLS, Identity, scan_tool_call
 
 HOME = Path(os.environ.get("EGRESS_GUARD_HOME", Path.home() / ".egress-guard"))
 CODEX = "--codex" in sys.argv  # Codex hook command: findings that would ask are denied (Codex has no "ask")
@@ -145,15 +148,16 @@ def _claude_email() -> str:
         return ""
 
 
-SELF_REASON = ("whoami-guard: only the user may change whoami-guard's settings or exceptions (its folder, "
-               "whoami-guard-allow, EGRESS_GUARD_* variables, the hook entry in the agent's settings). Ask the user; "
-               "they can run `! whoami-guard-allow` in this session.")
+SELF_REASON = ("whoami-guard blocked this control operation. A conversational yes does not grant an exception. ")
 # The agent must not grant itself an exception or switch the hook off (the user's own `!` commands are not hooked).
 # A shell segment that names a control (the allow command, the whoami-guard folder, an EGRESS_GUARD_* assignment,
 # the agent's hook settings) is denied unless it only reads (grep, cat, ls, git log ...), so docs and log reading
 # pass and `"whoami-guard-allow"`, `/usr/bin/whoami-guard-allow`, `python -c "...'.egress-guard'..."` do not
 # (Sol review r2, 2026-11-01). A script written first and run later is not seen: a seatbelt, not a sandbox.
-_CTRL = re.compile(r"whoami-guard-allow|egress_guard[./\\]allow|\.egress-guard|run_hook\.py[\"']?\s+allow\b|"
+# Running the hook itself is a control too (0.2.4): an event piped into it by the agent could fake a PostToolUse and
+# record an approval the user never gave.
+_CTRL = re.compile(r"whoami-guard-allow|egress_guard[./\\]allow|\.egress-guard|run_hook\.py|whoami-guard-hook|"
+                   r"egress_guard[./\\]hook|egress_guard\s+import\s+hook|"
                    r"\.claude[/\\]+settings(?:\.local)?\.json|\.codex[/\\]+(?:config\.toml|hooks\.json)", re.I)
 _ASSIGN = re.compile(r"(?:^|[\s;&|(]|\$env:)EGRESS_GUARD_\w+\s*=|\b(?:setx|set)\s+EGRESS_GUARD_\w+", re.I)
 # a write INTO a control file: redirect or tee target, PowerShell writers (sed: _sed_touches; perl is no reader)
@@ -426,10 +430,285 @@ def session_rec(session_id: str) -> dict:
         until = float(rec.get("until", 0)) if isinstance(rec, dict) else 0.0
         if not math.isfinite(until) or until <= time.time():  # "nan" compared false and granted forever (Sol r3)
             return {}
-    except (OSError, ValueError, TypeError, AttributeError):
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
         return {}  # a broken record grants nothing and never crashes the hook (Sol review r2)
     mode = rec.get("mode") if rec.get("mode") in ("ask", "off") else ""
-    return {"mode": mode, "emails": _strs(rec.get("emails")), "hosts": _strs(rec.get("hosts"))}
+    return {"mode": mode, "emails": _strs(rec.get("emails")), "hosts": _strs(rec.get("hosts")), "until": until}
+
+
+# Approval memory (0.2.4): a convenience against repeat prompts, not an authentication of the user's answer. A
+# question the user answered "yes" to is not asked again in the same session for the same data in the same call
+# shape. The PreToolUse hook that asks writes a pending record (session, tool_use_id, keyed digest of the call); the
+# PostToolUse event, which Claude Code sends only for a call that really ran, turns it into an approval. Only
+# findings that were a question become approvals: a call that was denied never runs, so a hard block is never
+# remembered. Everything stored is an HMAC, never a value; the salt sits in the same file, so this hides values from
+# a casual reader and does not stop an agent that sets out to forge a PostToolUse (the README's threat model).
+APPROVALS = "approvals.json"
+EPOCH_KEY = "_approvals_epoch"  # in sessions.json, written only by whoami-guard-allow; --clear changes it
+EPOCH_BROKEN = "\0unreadable"  # sessions.json exists but is unreadable: matches no stored epoch
+APPROVAL_HOURS = 2.0  # without a running session exception
+PENDING_TTL = 7200.0  # an unanswered question older than this is forgotten
+MAX_PENDING, MAX_APPROVED = 50, 500  # per session
+_NO_MEMORY_MODES = {"bypassPermissions", "dontAsk"}  # no prompt is shown there, so a run is no answer
+# Shell commands are remembered only as one built-in gh command (Sol review of 0.2.4): the same text of any other
+# command can send elsewhere (`curl -K file`, `$VAR`, a script, a gh alias redefined as a shell command). gh refuses
+# aliases and extensions named like a built-in command ("already a gh command or extension", checked with gh
+# 2.101.0), so `gh pr ...` always runs gh's own `pr`.
+GH_REMEMBER = {"issue", "pr", "api", "repo", "gist", "release", "search", "label", "workflow", "run", "discussion",
+               "project"}
+# Characters that let the shell (bash or PowerShell) pick or change the target at run time: expansions,
+# substitutions, redirections, chaining, subshells, globs, escapes, splatting. Outside quotes all of them; inside
+# double quotes the ones both shells still expand.
+# `#` too: an unquoted `# --hostname x` is a comment to the shell but an option to shlex (Sol review r3).
+_INDIRECT_BARE = set("$`<>|;&(){}[]*?~\\%!@#\n\r")
+_INDIRECT_DQ = set("$`\\!\n\r")
+
+
+def _mac(salt: str, *parts: str) -> str:
+    return hmac.new(bytes.fromhex(salt), "\0".join(parts).encode("utf-8", "replace"), hashlib.sha256).hexdigest()[:32]
+
+
+def _load_approvals(create: bool = False) -> dict | None:
+    """approvals.json, or None when there is none (and `create` is false). A malformed file counts as empty and gets
+    a new salt, which invalidates whatever it held: a broken file grants nothing and never crashes the hook."""
+    try:
+        d = json.loads((HOME / APPROVALS).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        d = None
+    salt = d.get("salt") if isinstance(d, dict) else None
+    if not (isinstance(salt, str) and re.fullmatch(r"[0-9a-f]{32,128}", salt)):
+        if not create:
+            return None
+        return {"v": 1, "salt": secrets.token_hex(16), "pending": {}, "approved": {}}
+    return {"v": 1, "salt": salt,
+            "pending": d["pending"] if isinstance(d.get("pending"), dict) else {},
+            "approved": d["approved"] if isinstance(d.get("approved"), dict) else {}}
+
+
+def _save_approvals(data: dict) -> None:
+    now = time.time()
+    for name, alive, cap in (("pending", lambda e: now - _num(e.get("ts")) < PENDING_TTL, MAX_PENDING),
+                             ("approved", lambda e: _num(e.get("until")) > now, MAX_APPROVED)):
+        table = data[name]
+        for sid in list(table):
+            rows = [e for e in table[sid] if isinstance(e, dict) and alive(e)] if isinstance(table[sid], list) else []
+            if rows:
+                table[sid] = rows[-cap:]
+            else:
+                del table[sid]
+    tmp = HOME / f"{APPROVALS}.{os.getpid()}.tmp"
+    try:
+        HOME.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, HOME / APPROVALS)  # a reader never sees half a file
+    except OSError:
+        # another session holds the file (Windows): this approval is not remembered, the next call asks again
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _num(v) -> float:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if math.isfinite(f) else 0.0
+
+
+def _shell_indirect(cmd: str) -> bool:
+    """Anything in a shell line that can make the same text reach another target at run time."""
+    q = ""
+    for c in cmd:
+        if q == "'":
+            q = "" if c == "'" else q  # single quotes: literal in bash and PowerShell
+        elif q == '"':
+            if c in _INDIRECT_DQ:
+                return True
+            q = "" if c == '"' else q
+        elif c in "'\"":
+            q = c
+        elif c in _INDIRECT_BARE:
+            return True
+    return bool(q)  # an unclosed quote: do not guess
+
+
+def _gh_destination(cmd: str, cwd: str) -> list[str] | None:
+    """`gh <built-in> ...` with no shell indirection: the subcommand group and the host gh really talks to (GitHub or
+    the host it names) from this folder (its git remote picks the repository). None for every other shell line."""
+    if _shell_indirect(cmd):
+        return None
+    try:
+        toks = shlex.split(cmd, posix=True)
+    except ValueError:
+        return None
+    if len(toks) < 2 or toks[0].lower() not in ("gh", "gh.exe") or toks[1] not in GH_REMEMBER:
+        return None
+    # Options that read a file (--body-file, -F, --input, --notes-file, --template) change what is sent, never the
+    # host: --hostname / -R and the endpoint stay in the command text. They can change the content and, for
+    # `gh api graphql --input`, the repository on the same host. The approval covers only the value found in this
+    # text, so a file option does not stop the memory (a bare `@file` already counts as indirection above).
+    hosts = _gh_targets(toks)
+    if hosts is None:
+        return None
+    return sorted({"cmd:gh", "sub:" + toks[1], "cwd:" + cwd} | {"host:" + h for h in hosts})
+
+
+_URL_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://")
+
+
+def _gh_targets(toks: list[str]) -> set[str] | None:
+    """The host gh will actually talk to (Sol review r2: not every host named anywhere, e.g. in a --body): the value
+    of --hostname, the HOST of `-R/--repo HOST/OWNER/REPO`, else GH_HOST from the environment the hook sees, else
+    github.com. A token that is a whole URL (`gh pr view https://host/o/r/pull/1`, `gh api https://host/x`) can
+    pick the host itself: not remembered. So is a bundle of short flags hiding -R (`-wR host/o/r`)."""
+    hosts: set[str] = set()
+    repo_hosts: set[str] = set()
+    it = iter(enumerate(toks[2:]))
+    for _, t in it:
+        if _URL_TOKEN.match(t):
+            return None
+        val = None
+        if t in ("--hostname", "-R", "--repo"):
+            val = next(it, (0, ""))[1]
+            name = t
+        elif t.startswith(("--hostname=", "--repo=")):
+            name, val = t.split("=", 1)
+        elif t.startswith("-R") and len(t) > 2:
+            name, val = "-R", t[2:].lstrip("=")
+        elif t.startswith("-") and not t.startswith("--") and "R" in t[2:]:
+            return None
+        if val is None:
+            continue
+        if _URL_TOKEN.match(val):
+            return None
+        val = val.strip().lower().rstrip(".")
+        if name == "--hostname":
+            hosts.add(val)
+        elif val.count("/") >= 2:
+            repo_hosts.add(val.split("/", 1)[0].rstrip("."))
+    hosts |= repo_hosts
+    if not hosts:
+        env = {os.environ.get(k, "").strip().lower() for k in ("GH_HOST",)} - {""}
+        repo = os.environ.get("GH_REPO", "").strip().lower()
+        if repo.count("/") >= 2:
+            env.add(repo.split("/", 1)[0])
+        hosts = env or {"github.com"}
+    return hosts if all(h and re.fullmatch(r"[a-z0-9.-]+(?::\d+)?", h) for h in hosts) else None
+
+
+def _destinations(event: dict) -> list[str] | None:
+    """The call shape an approval is bound to, or None when this call is never remembered. Non-shell tools (MCP,
+    WebFetch, file tools): the whole tool input, word for word, so another channel, recipient, URL or file asks
+    again. Shell tools: only one built-in gh command (see GH_REMEMBER); everything else asks every time."""
+    tool = str(event.get("tool_name") or "")
+    inp = event.get("tool_input") or {}
+    if tool not in SHELL_TOOLS:
+        return ["call:" + tool + "\0" + json.dumps(inp, sort_keys=True)]
+    cmd = inp.get("command") if isinstance(inp, dict) else None
+    if not isinstance(cmd, str):
+        return None
+    return _gh_destination(cmd, str(event.get("cwd") or ""))
+
+
+def _epoch() -> str:
+    """The revocation epoch: whoami-guard-allow --clear writes a new one into sessions.json (the hook never writes
+    that file), and approvals or questions from another epoch count for nothing. A PostToolUse that raced --clear
+    and wrote approvals back after the delete cannot bring them to life. No file yet: "". A file that exists but
+    cannot be read or parsed: EPOCH_BROKEN, under which no approval matches and none is recorded (fail closed)."""
+    try:
+        d = json.loads((HOME / "sessions.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError, RecursionError):
+        return EPOCH_BROKEN
+    if not isinstance(d, dict):
+        return EPOCH_BROKEN
+    v = d.get(EPOCH_KEY, "")
+    return v if isinstance(v, str) and v != EPOCH_BROKEN else EPOCH_BROKEN
+
+
+def _approval_key(salt: str, finding, dests: list[str]) -> str:
+    return _mac(salt, "approval", finding.kind, finding.needle, *dests)
+
+
+def _call_mac(salt: str, event: dict) -> str:
+    return _mac(salt, "call", str(event.get("tool_name") or ""),
+                json.dumps(event.get("tool_input") or {}, sort_keys=True))
+
+
+def _approved(data: dict | None, sid: str, ask_mode: bool, epoch: str) -> set[str]:
+    """Keys approved for this session and still valid. Approvals of findings that are only a question because of a
+    running `--ask` exception count only while that exception runs."""
+    if not data or not sid:
+        return set()
+    if epoch == EPOCH_BROKEN:
+        return set()
+    now, keys = time.time(), set()
+    rows = data["approved"].get(sid)
+    for e in rows if isinstance(rows, list) else []:
+        if isinstance(e, dict) and isinstance(e.get("k"), str) and _num(e.get("until")) > now and \
+                e.get("e", "") == epoch and (ask_mode or not e.get("m")):
+            keys.add(e["k"])
+    return keys
+
+
+def remember(event: dict) -> dict:
+    """PostToolUse: the call ran, so if this session's hook asked about exactly this call (same tool_use_id, same
+    content), the user said yes: remember its findings for the same destinations. Never blocks, never prints."""
+    sid = str(event.get("session_id") or "")
+    codex = CODEX or os.environ.get("EGRESS_GUARD_AGENT", "").strip().lower() == "codex"
+    if not sid or codex or str(event.get("permission_mode") or "") in _NO_MEMORY_MODES:
+        return {}
+    data = _load_approvals()
+    rows = data["pending"].get(sid) if data else None
+    if not data or not isinstance(rows, list):
+        return {}
+    now, tuid, call = time.time(), str(event.get("tool_use_id") or ""), _call_mac(data["salt"], event)
+    hit = next((e for e in rows if isinstance(e, dict) and e.get("id") == tuid and e.get("call") == call
+                and now - _num(e.get("ts")) < PENDING_TTL), None)
+    if hit is None:
+        return {}
+    rows.remove(hit)
+    epoch = hit.get("e", "")
+    if epoch != _epoch() or epoch == EPOCH_BROKEN:
+        _save_approvals(data)
+        return {}  # asked before a --clear: that question no longer counts
+    rec = session_rec(sid)
+    ask_now = (str(rec.get("mode") or "") or os.environ.get("EGRESS_GUARD_MODE", "").strip().lower()) == "ask"
+    until = rec.get("until") or now + APPROVAL_HOURS * 3600  # the session exception's end, else 2 hours
+    n = 0
+    keys = hit.get("keys")
+    for item in keys if isinstance(keys, list) else []:
+        if not (isinstance(item, list) and len(item) == 2 and isinstance(item[0], str)):
+            continue
+        key, ask_mode = item[0], bool(item[1])
+        if ask_mode and not ask_now:
+            continue  # the --ask exception ended between the question and the run
+        rows_ok = data["approved"].get(sid)
+        data["approved"][sid] = (rows_ok if isinstance(rows_ok, list) else []) + [
+            {"k": key, "m": ask_mode, "until": until, "e": epoch}]
+        n += 1
+    _save_approvals(data)
+    if n:
+        _log({"ts": now, "event": "PostToolUse", "tool": event.get("tool_name"), "remembered": n, "session": sid,
+              "folder": Path(str(event.get("cwd") or "")).name})
+    return {}
+
+
+def _ask_pending(event: dict, sid: str, data: dict | None, keys: list[tuple[str, bool]], epoch: str) -> None:
+    """Note the question, so that the PostToolUse of this very call can turn it into an approval. `epoch` is the one
+    read when the decision started: a question that crossed a --clear stays in the old epoch."""
+    if not sid or not keys or epoch == EPOCH_BROKEN:
+        return
+    data = data or _load_approvals(create=True)
+    rows = data["pending"].get(sid)
+    rows = rows if isinstance(rows, list) else []
+    rows.append({"id": str(event.get("tool_use_id") or ""), "call": _call_mac(data["salt"], event),
+                 "ts": time.time(), "e": epoch, "keys": [[k, m] for k, m in keys]})
+    data["pending"][sid] = rows
+    _save_approvals(data)
 
 
 _HOST = re.compile(r"https?://(?:[^/\s'\"@]*@)?([A-Za-z0-9.-]+)", re.IGNORECASE)
@@ -462,6 +741,35 @@ def _allow_cmd(args: list[str]) -> str:
     if os.name == "nt":
         out += f" (PowerShell: `& {' '.join(_ps(x) for x in argv)}`)"
     return out
+
+
+def _owner_handoff(event: dict) -> str:
+    codex = (CODEX or os.environ.get("EGRESS_GUARD_AGENT", "").strip().lower() == "codex"
+             or str(event.get("tool_name") or "") in {"exec_command", "apply_patch", "shell"})
+    if not codex:
+        return " Please paste the exception command above for the user to run with !."
+    return (" CODEX — NEXT RESPONSE, BEFORE ANY MORE TOOLS: briefly name the blocked operation in the user's "
+            "language, then paste the exact ! command above in a code block and tell the user to paste and run it. "
+            "Do not replace the command with a yes/no question, a form, a board entry, or an apology. "
+            "Do not run it yourself. WAIT FOR EXECUTION, NOT VERBAL APPROVAL: a <user_shell_command> result "
+            "with Exit code: 0 is the user's execution confirmation. Acknowledge it immediately and retry the "
+            "unchanged blocked operation once; do not wait for 'done'/'gotowe' or ask the user to repeat it. "
+            "For an installation command, verify the installation instead of reinstalling. If the command "
+            "fails, report its actual error and do not assume approval. Do not rewrite a denied operation "
+            "to bypass the hook.")
+
+
+def _control_escalation(event: dict) -> str:
+    from egress_guard import control
+
+    sid = str(event.get("session_id") or "")
+    if not sid:
+        return ("This call has no session id, so a scoped exception cannot be issued. "
+                "Report the missing session id to the user; do not choose another session.")
+    command = _allow_cmd(["--control-once", control.digest(event), "--session", sid])
+    return (f"Owner-run exception: {command}. This grants one unchanged tool call in this session for 10 minutes; "
+            "it does not turn off other checks. For commands that read scripts or files, show those contents "
+            "for review too: the exception binds the command, not file contents." + _owner_handoff(event))
 
 
 def _host_helps(ident: Identity, event: dict, hosts: list[str], strict: bool, codex: bool) -> bool:
@@ -506,17 +814,71 @@ def _escalation(ident: Identity, event: dict, kinds: list[str], strict: bool = F
                  "`--list` and its error message show the ids)")
     out += (" If sending this is really needed for the user's task, stop and ask the user: say what you want to send, "
             f"to which site and why, and give them this command, which {what} {where}: "
-            f"{_allow_cmd(args)}. Do not retry with the data rewritten or encoded.")
+            f"{_allow_cmd(args)}. Do not retry with the data rewritten or encoded." + _owner_handoff(event))
     return out
+
+
+AI_AUTHOR_REASON = ("whoami-guard: this commit names an AI agent as its author or co-author ({what}). The user is the "
+                    "only author: remove the `Co-authored-by:` line / the AI author address and commit again. Disclose "
+                    "AI use in the PR description where the project asks for it, not in the commit.")
+# 0.2.4: the agent must not put its own identity into commits (a `Co-authored-by: Claude <noreply@anthropic.com>`
+# trailer, `--author`, `user.email=` of an AI vendor). It is not the user's personal data, but per-author CLA bots
+# fail on it and the user did not ask for it. Checked on shell lines that run a git command which writes a commit
+# or tag; a message file given with -F / --file is read too (it was written before this call).
+_GIT_WRITE = re.compile(r"\bgit\b(?:\s+-c\s+\S+|\s+-C\s+\S+|\s+--[\w-]+(?:=\S+)?)*\s+"
+                        r"(?:commit|commit-tree|merge|tag|am|cherry-pick|rebase|revert|notes)\b", re.I)
+_AI_WORD = (r"(?:claude|anthropic|codex|openai|chatgpt|gpt-?\d[\w.-]*|copilot|gemini|cursor(?:\s+agent)?|devin|"
+            r"aider|windsurf|codeium|amazon\s+q|tabnine)")
+_AI_TRAILER = re.compile(r"co-?authored-?by\s*:\s*[^\n\"'<]{0,120}?(?:\b" + _AI_WORD + r"\b[^\n\"']{0,120}|"
+                         r"<[^>\n]*@(?:anthropic|openai)\.com>)", re.I)
+_AI_ADDR = re.compile(r"(?:--author[=\s]+[\"']?[^\"'\n]{0,120}?|user\.(?:email|name)\s*=\s*[\"']?|"
+                      r"GIT_(?:AUTHOR|COMMITTER)_(?:EMAIL|NAME)\s*=\s*[\"']?)"
+                      r"(?:[^\s\"']*@(?:anthropic|openai)\.com|" + _AI_WORD + r"\b)", re.I)
+_MSG_FILE = re.compile(r"(?:^|\s)(?:-F\s*|--file[=\s]+)([\"']?)([^\s\"']+)\1")
+MAX_MSG_FILE = 65536
+
+
+def _ai_author(event: dict) -> str:
+    """What names an AI agent as commit author/co-author in this call, or ''."""
+    if str(event.get("tool_name") or "") not in SHELL_TOOLS:
+        return ""
+    cmd = str((event.get("tool_input") or {}).get("command") or "")
+    if not _GIT_WRITE.search(cmd):
+        return ""
+    if m := _AI_TRAILER.search(cmd):
+        return " ".join(m.group(0).split())[:80]
+    if m := _AI_ADDR.search(cmd):
+        return " ".join(m.group(0).split())[:80]
+    cwd = Path(str(event.get("cwd") or "."))
+    for seg in _segments(cmd):
+        if not _GIT_WRITE.search(seg):
+            continue
+        for fm in _MSG_FILE.finditer(seg):
+            p = Path(fm.group(2))
+            try:
+                text = (p if p.is_absolute() else cwd / p).read_text(encoding="utf-8", errors="replace")[:MAX_MSG_FILE]
+            except OSError:
+                continue
+            if m := _AI_TRAILER.search(text):
+                return " ".join(m.group(0).split())[:80] + f" (in {p.name})"
+    return ""
 
 
 def decide(event: dict, ident: Identity, strict: bool) -> dict:
     t0 = time.perf_counter()
-    if _touches_controls(event):
+    from egress_guard import control
+
+    if _touches_controls(event) and not control.consume(event, HOME):
         _log({"ts": time.time(), "tool": event.get("tool_name"), "blocked": True, "kinds": ["self-protection"],
               "session": str(event.get("session_id") or ""), "folder": Path(str(event.get("cwd") or "")).name})
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
-                                       "permissionDecisionReason": SELF_REASON}}
+                                       "permissionDecisionReason": SELF_REASON + _control_escalation(event)}}
+    if os.environ.get("EGRESS_GUARD_AI_AUTHOR", "").strip().lower() != "allow" and (what := _ai_author(event)):
+        # independent of session exceptions: it is a rule about authorship, not a question about personal data
+        _log({"ts": time.time(), "tool": event.get("tool_name"), "blocked": True, "kinds": ["ai-author"],
+              "session": str(event.get("session_id") or ""), "folder": Path(str(event.get("cwd") or "")).name})
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                       "permissionDecisionReason": AI_AUTHOR_REASON.format(what=what)}}
     sid = str(event.get("session_id") or "")
     rec = session_rec(sid)
     if rec.get("emails") or rec.get("hosts"):
@@ -524,32 +886,75 @@ def decide(event: dict, ident: Identity, strict: bool) -> dict:
                         allow_hosts=ident.allow_hosts + list(rec.get("hosts", [])))
     found = scan_tool_call(event.get("tool_name", ""), event.get("tool_input", {}), ident, strict,
                            cwd=event.get("cwd"))
+    mode = str(rec.get("mode") or "") or os.environ.get("EGRESS_GUARD_MODE", "").strip().lower()
+    codex = CODEX or os.environ.get("EGRESS_GUARD_AGENT", "").strip().lower() == "codex"
+    approved, memo, data, epoch = 0, [], None, ""
+    if found and sid and mode != "off" and not codex:
+        epoch = _epoch()  # once per decision; the pending note keeps this one (a --clear meanwhile revokes it)
+        # approval memory: drop findings the user already approved in this session for the same destinations
+        hard_kinds = set(_hard(ident, {f.kind for f in found}))
+        ask_mode = mode == "ask"
+        dests = _destinations(event)  # None: a call shape that is never remembered (most shell commands)
+        if dests is not None and (ask_mode or any(f.kind not in hard_kinds for f in found)):
+            data = _load_approvals()
+            salt = (data or (data := _load_approvals(create=True)))["salt"]
+            ok, keep = _approved(data, sid, ask_mode, epoch), []
+            for f in found:
+                exact = f.kind in hard_kinds  # a block in the normal mode, a question only under --ask
+                if exact and not ask_mode:
+                    keep.append(f)  # a hard block is never approved
+                    continue
+                key = _approval_key(salt, f, dests)
+                if key in ok:
+                    approved += 1
+                    continue
+                keep.append(f)
+                memo.append((key, exact))
+            found = keep
     kinds = sorted({f.kind for f in found})
     # session id and folder name (no personal data) so `whoami-guard-allow` can find the session it is run in
     _log({"ts": time.time(), "tool": event.get("tool_name"), "blocked": bool(found), "kinds": kinds,
           "session": sid, "folder": Path(str(event.get("cwd") or "")).name,
-          "ms": round((time.perf_counter() - t0) * 1000, 3)})
+          "ms": round((time.perf_counter() - t0) * 1000, 3), **({"approved": approved} if approved else {})})
     if not found:
         return {}
-    mode = str(rec.get("mode") or "") or os.environ.get("EGRESS_GUARD_MODE", "").strip().lower()
     if mode == "off":
         return {}  # the user's exception: one terminal (env) or one session (whoami-guard-allow)
-    hard = [k for k in kinds if "@" not in k and (  # "kind@host": an allowed host in a shell line, ask
-            k not in ASK_KINDS or
-            (k == "contact-email" and ident.contact_fields == "deny") or
-            (k != "contact-email" and ident.fuzzy == "deny"))]
+    hard = _hard(ident, kinds)
     if mode == "ask":
         hard = []
-    if CODEX or os.environ.get("EGRESS_GUARD_AGENT", "").strip().lower() == "codex":
+    if codex:
         # Codex treats "ask" as an unsupported result and runs the tool (Sol review 2026-11-01): deny there
         hard = hard or kinds
     if hard:
         return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                        "permissionDecisionReason": REASON.format(kinds=", ".join(kinds))
                                        + _escalation(ident, event, kinds, strict)}}
+    _ask_pending(event, sid, data, memo, epoch)
+    memory = (" If the user approves, the same data in the same call (for gh: the same gh command group, target host "
+              "and folder) is not "
+              "asked about again in this session (until the session exception ends, otherwise 2 hours; "
+              "`whoami-guard-allow --clear` forgets).") if memo else ""
     return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "ask",
                                    "permissionDecisionReason": ASK_REASON.format(kinds=", ".join(kinds))
-                                   + _escalation(ident, event, kinds, strict)}}
+                                   + _escalation(ident, event, kinds, strict) + memory}}
+
+
+def _hard(ident: Identity, kinds) -> list[str]:
+    """Kinds that are a block in the normal mode (no exception), not a question."""
+    return sorted(k for k in kinds if "@" not in k and (  # "kind@host": an allowed host in a shell line, ask
+        k not in ASK_KINDS or
+        (k == "contact-email" and ident.contact_fields == "deny") or
+        (k != "contact-email" and ident.fuzzy == "deny")))
+
+
+def handle(event: dict, ident: Identity | None, strict: bool) -> dict:
+    """One hook event: PostToolUse feeds the approval memory, anything else is a PreToolUse decision."""
+    if str(event.get("hook_event_name") or "") == "PostToolUse":
+        return remember(event)
+    if ident is None:
+        ident, strict = load_identity()
+    return decide(event, ident, strict)
 
 
 def _log(rec: dict) -> None:
@@ -568,7 +973,11 @@ def serve(addr: str) -> None:
     class H(BaseHTTPRequestHandler):
         def do_POST(self):
             body = self.rfile.read(int(self.headers.get("Content-Length", 0)) or 0)
-            out = decide(json.loads(body or b"{}"), ident, strict)
+            event = json.loads(body or b"{}")
+            # No approval memory here: any local process (the agent's curl too) can POST a fake PostToolUse to this
+            # port. PostToolUse events are answered with nothing.
+            is_post = isinstance(event, dict) and event.get("hook_event_name") == "PostToolUse"
+            out = {} if is_post else decide(event, ident, strict)
             data = json.dumps(out).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -586,11 +995,20 @@ def main() -> int:
     if len(sys.argv) > 2 and sys.argv[1] == "--serve":
         serve(sys.argv[2])
         return 0
+    event = None
     try:
         event = json.loads(sys.stdin.read() or "{}")
-        ident, strict = load_identity()
-        out = decide(event, ident, strict)
+        if isinstance(event, dict) and event.get("hook_event_name") == "PostToolUse":
+            # the approval memory; it never blocks and never needs the identity (fast path, every tool call)
+            out = handle(event, None, False)
+        else:
+            ident, strict = load_identity()
+            out = handle(event, ident, strict)
     except Exception as e:  # noqa: BLE001
+        if isinstance(event, dict) and event.get("hook_event_name") == "PostToolUse":
+            # the call already ran: a broken memory only means the next call asks again
+            _log({"ts": time.time(), "event": "PostToolUse", "kinds": ["guard-error"], "error": type(e).__name__})
+            return 0
         # A crash is a non-blocking hook error to the agent, so the call would run unchecked: deny instead and keep
         # the error type (no call content) in the local log (Astra review r6)
         _log({"ts": time.time(), "blocked": True, "kinds": ["guard-error"], "error": type(e).__name__})

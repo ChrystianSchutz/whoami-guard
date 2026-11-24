@@ -24,6 +24,12 @@ Write-up with the full measurement: https://chrystianschutz.com/blog/coding-agen
   are left alone, also when chained with an unrelated download.
 - Pure standard library, no model, no dependencies; a scan takes well under 1 ms (p95 0.2-0.5 ms on our machine).
 - Logs every decision to `~/.egress-guard/log.jsonl` with the matched *kind* (email, name, surname), never the value.
+- Keeps the agent out of your commits (0.2.4): a `git commit` / `tag` / `merge` ... whose message carries a
+  `Co-authored-by:` line naming an AI agent (Claude, Codex, Copilot, `@anthropic.com`, `@openai.com` ...), or that
+  sets an AI address as author (`--author`, `user.email=`, `GIT_AUTHOR_EMAIL=`), is denied; a message file given
+  with `-F` / `--file` is read too. Per-author CLA bots fail on such co-authors, and you are the author.
+  Session exceptions do not lift it; set the variable `EGRESS_GUARD_AI_AUTHOR` to `allow` in your own environment
+  to turn it off.
 
 ## Measured result
 
@@ -53,7 +59,7 @@ uv tool install whoami-guard
 uv tool update-shell   # only if the commands are not found in a new terminal
 ```
 
-No install at all: point the hook at `uvx --from whoami-guard==0.2.3 whoami-guard-hook` (for Codex add
+No install at all: point the hook at `uvx --from whoami-guard==0.2.4 whoami-guard-hook` (for Codex add
 `--codex` at the end). uv downloads and caches it on first use; pinning the version keeps the hook from changing
 under you. Approve a one-off exception the same way: `uvx --from whoami-guard whoami-guard-allow --host example.com`.
 
@@ -77,7 +83,8 @@ pipx, as above), or use the launcher in [`contrib/run_hook.py`](contrib/run_hook
 This install puts no `whoami-guard-allow` on PATH: run exceptions as `python ~/.egress-guard/run_hook.py allow ...`
 or copy the command from the block message (full paths, works in any shell).
 
-Check the install with one allowed and one denied event (the second line must print a `deny` decision):
+Check the install in your own terminal (the hook denies agents that try to run it) with one allowed and one
+denied event (the second line must print a `deny` decision):
 
 ```sh
 echo '{"tool_name":"Bash","tool_input":{"command":"curl -A research-script/1.0 https://example.org"}}' | whoami-guard-hook
@@ -89,13 +96,20 @@ echo '{"tool_name":"Bash","tool_input":{"command":"curl -A \"bot (you@your-mail.
 ### Claude Code (`~/.claude/settings.json`)
 
 ```json
-{"hooks": {"PreToolUse": [{"matcher": "Bash|PowerShell|WebFetch|Write|Edit|MultiEdit|mcp__.*",
-  "hooks": [{"type": "command", "command": "whoami-guard-hook", "onFailure": "block", "timeout": 10}]}]}}
+{"hooks": {
+  "PreToolUse": [{"matcher": "Bash|PowerShell|WebFetch|Write|Edit|MultiEdit|mcp__.*",
+    "hooks": [{"type": "command", "command": "whoami-guard-hook", "onFailure": "block", "timeout": 10}]}],
+  "PostToolUse": [{"matcher": "Bash|PowerShell|WebFetch|Write|Edit|MultiEdit|mcp__.*",
+    "hooks": [{"type": "command", "command": "whoami-guard-hook", "timeout": 10}]}]}}
 ```
 
-Set `"onFailure": "block"`: hooks fail open by default, so a broken install would silently let everything through.
+Set `"onFailure": "block"` on the PreToolUse entry: hooks fail open by default, so a broken install would silently
+let everything through. The PostToolUse entry (0.2.4) is the **approval memory**: it only learns which questions you
+approved and never blocks, so it needs no `onFailure`. Without it everything works as before, and every question is
+asked again. Use the same command as for PreToolUse (`run_hook.py` and `uvx` installs too).
 For lower latency there is a resident HTTP mode (`whoami-guard-hook --serve 127.0.0.1:8977`, ~1 ms per call, no
-process start); point a Claude Code HTTP hook at it.
+process start); point a Claude Code HTTP hook at it. The HTTP mode has no approval memory (any local process
+could post a fake PostToolUse to the port); keep a command hook for PostToolUse if you want it.
 
 ### Codex (`~/.codex/config.toml`)
 
@@ -185,17 +199,44 @@ The shim also reads request bodies and headers given as files (`-d @body.json`, 
 - **Session exceptions** (`whoami-guard-allow`, run by you inside the agent session with the `!` prefix, which Claude
   Code runs outside the hooks): `--email ADDR` / `--host HOST` add to the allow lists for this session only;
   no list means questions instead of blocks; `--off` turns checks off; a number sets the hours (default 2);
-  `--list` (exceptions and recent session ids), `--clear`. The block message gives the exact command with
+  `--list` (exceptions, remembered approvals and recent session ids), `--clear` (also revokes remembered
+  approvals). The block message gives the exact command with
   `--session` of the session that asked. Without `--session` the command takes the session of the last tool call
   the hook saw and refuses when several sessions were active in the last 10 minutes, or when a call without a
-  session id was blocked. Malformed exception files grant nothing and `--clear` always works.
-- **Self-protection:** the hook denies agent shell commands that run the allow command (also quoted or by full
-  path), set `EGRESS_GUARD_*` variables, write into the whoami-guard folder or the agent's hook settings, or run code
+  session id was blocked. Malformed exception files grant nothing and `--clear` works on them; if it cannot write
+  its file it says so and exits with 1.
+- **Self-protection:** the hook denies agent shell commands that run the allow command or the hook itself (also
+  quoted or by full path; a piped-in fake event could otherwise record an approval), set `EGRESS_GUARD_*` variables, write into the whoami-guard folder or the agent's hook settings, or run code
   that names them (`python -c "...'.egress-guard'..."`, `$(whoami-guard-allow --off)`), and file edits that change
   the hook entry in `~/.claude/settings.json` or `~/.codex/config.toml` (removing it, narrowing its matcher, moving
   it to another event, `disableAllHooks`). Commands that only read (grep, cat, sed -n, ls, git log) pass. A script
   written first and run later is not seen: this keeps a well-meaning agent from "fixing" a block by itself, it does
   not stop one that hides what it does.
+- **Approval memory** (0.2.4, Claude Code, needs the PostToolUse entry above): approve a question once, and the
+  same data in the same kind of call is not asked about again in that session. The match is narrow on purpose:
+  - MCP tools, web fetches and file tools: the whole tool input must be the same, word for word. Another channel,
+    recipient, URL or file asks again.
+  - Shell: only a plain `gh` built-in command (`gh pr`, `gh issue`, `gh api`, `gh repo`, `gh release`, ...). The
+    approval is bound to that command group, the folder, and the host gh will talk to: the `--hostname` value, the
+    HOST of `-R HOST/OWNER/REPO`, else `GH_HOST` if the hook can see it, else github.com. Hosts mentioned elsewhere
+    (a URL in `--body`) do not count. Anything that can change the target at run time is never remembered: `$VAR`,
+    backticks, redirections, pipes, `;` / `&&`, globs, gh aliases and extensions, a bare `@file`, a whole URL as an
+    argument (`gh api https://...`, `gh pr view https://...`). Options that read a file (`--body-file`, `-F`,
+    `--input`) can change the content and, for `gh api graphql --input`, the repository on the same host, but not
+    the host, so they do not stop the memory. Every other shell command, curl included, asks every time. Known
+    limit: `GH_HOST` exported inside the agent's own shell (not in the environment Claude Code started with) is not
+    visible to the hook.
+  - Only questions are remembered: a blocked call never runs, so a block never becomes an approval, and exact
+    matches approved under `--ask` count only while that `--ask` exception runs.
+  - Approvals end with the session exception (no exception: after 2 hours) and with `--clear`, which revokes them
+    at once, also ones written back by a call still finishing. If the exceptions file is unreadable, no approval
+    counts until the next `whoami-guard-allow` replaces it. Nothing is remembered in `bypassPermissions` /
+    `dontAsk` mode (no question is shown there); Codex has no questions, so it has nothing to remember.
+
+  This is a convenience against repeat prompts for an agent that plays along, not proof that you approved
+  something. Approvals are stored in `approvals.json` in the whoami-guard folder as salted hashes, so the file shows
+  no values, but the salt sits next to them: an agent set on getting around the guard can forge an approval the
+  same way it can get around the other self-protection above.
 - Per terminal: `EGRESS_GUARD_MODE=ask` (questions instead of blocks) or `off`, set before starting the agent.
 - **Codex** has no "ask": add `--codex` to the hook command there and every question becomes a block.
 
@@ -270,7 +311,7 @@ python -I bench/heldout.py <tag>
   author = {Schutz, Chrystian},
   title  = {whoami-guard: an identity-aware egress hook for coding agents},
   year   = {2026},
-  version = {0.2.3},
+  version = {0.2.4},
   url    = {https://github.com/ChrystianSchutz/whoami-guard}
 }
 ```

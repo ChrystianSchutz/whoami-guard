@@ -8,7 +8,7 @@ Run it inside the agent session with the `!` prefix (Claude Code runs `!` comman
     ! whoami-guard-allow 8 --email a@b.io --host sec.gov   # several at once, for 8 hours
     ! whoami-guard-allow 1 --off                 # this session: no checks at all for 1 hour
     ! whoami-guard-allow --list                  # running exceptions
-    ! whoami-guard-allow --clear                 # end all exceptions
+    ! whoami-guard-allow --clear                 # end all exceptions and forget remembered approvals
 
 The block message gives the exact command with `--session <id>` for the session that asked. Without --session the
 command uses the session of the last tool call the hook saw, and refuses when several sessions were active in the
@@ -26,10 +26,13 @@ from pathlib import Path
 if __package__ in (None, ""):  # run as a file: import the package this file belongs to, not this folder's modules
     sys.path[0] = str(Path(__file__).resolve().parent.parent)
 
-from egress_guard.hook import HOME  # noqa: E402
+import os  # noqa: E402
+import secrets  # noqa: E402
+
+from egress_guard.hook import APPROVALS, EPOCH_BROKEN, EPOCH_KEY, HOME, _epoch  # noqa: E402
 
 USAGE = ("usage: whoami-guard-allow [HOURS] [--email ADDR]... [--host HOST]... [--ask|--off] "
-         "[--session ID] [--list|--clear]")
+         "[--session ID] [--list|--clear] | --control-once DIGEST --session ID")
 
 
 def _until(v) -> float:
@@ -48,10 +51,21 @@ def _load() -> dict:
     """Running exceptions; malformed records are dropped instead of crashing (Sol review r2)."""
     try:
         d = json.loads((HOME / "sessions.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
     now = time.time()
     return {str(k): v for k, v in d.items() if _until(v) > now} if isinstance(d, dict) else {}
+
+
+def _remembered() -> dict[str, int]:
+    """Approvals the hook remembered (questions the user answered yes), per session: counts only, they are hashes."""
+    try:
+        d = json.loads((HOME / APPROVALS).read_text(encoding="utf-8")).get("approved") or {}
+        now, epoch = time.time(), _epoch()
+        return {str(sid): n for sid, rows in d.items()
+                if (n := sum(1 for e in rows if isinstance(e, dict) and _until(e) > now and e.get("e", "") == epoch))}
+    except (OSError, ValueError, AttributeError, TypeError, RecursionError):
+        return {}
 
 
 def _log_lines() -> list[str]:
@@ -131,44 +145,151 @@ def main(argv: list[str] | None = None) -> int:
         print(USAGE)
         return 0
     now = time.time()
-    data = _load()
-    if "--clear" in args:
-        data = {}
-        print("whoami-guard: all session exceptions ended")
-    elif "--list" in args:
-        for sid, v in data.items():
-            print(f"{sid[:8]}...  folder={v.get('folder', '')}  mode={v.get('mode') or 'normal'}  "
-                  f"emails={v.get('emails', [])}  hosts={v.get('hosts', [])}  "
-                  f"{round((_until(v) - now) / 3600, 1)} h left")
-        if not data:
-            print("whoami-guard: no session exceptions")
-        for sid, folder, ts in _sessions()[:6]:  # the ids --session takes
-            print(f"session {sid[:12]}  folder={folder or '?'}  last call {round((now - ts) / 60)} min ago")
-        return 0
-    else:
-        prefix = next((a.split("=", 1)[1] for a in args if a.startswith("--session=")), "") or \
-            (_values(args, "--session") or [""])[0]
-        sid, folder, err = _pick_session(prefix.strip())
-        if err:
-            print(f"whoami-guard: {err}; nothing changed", file=sys.stderr)
+    if "--clear" in args or "--list" not in args:
+        # every change reads and writes sessions.json under one lock (Sol review r2: an exception command running
+        # next to --clear could write the old exceptions back after it)
+        lock = _lock()
+        if lock is None:
+            print("whoami-guard: sessions.json is locked by another whoami-guard-allow (or the folder is not "
+                  f"writable); nothing changed. If no other one is running, delete {HOME / LOCK} and retry.",
+                  file=sys.stderr)
             return 1
-        emails, hosts = _values(args, "--email"), _values(args, "--host")
-        skip = {i + 1 for i, a in enumerate(args) if a in ("--email", "--host", "--session")}
-        nums = [a for i, a in enumerate(args) if i not in skip and a.replace(".", "", 1).isdigit()]
-        hours = float(nums[0]) if nums else 2.0
-        mode = "off" if "--off" in args else "ask" if ("--ask" in args or not (emails or hosts)) else ""
-        rec = data.get(sid, {})
-        rec.update(until=now + hours * 3600, folder=folder or rec.get("folder", ""))
-        if mode:
-            rec["mode"] = mode
-        rec["emails"] = sorted(set(_list(rec.get("emails"))) | set(emails))
-        rec["hosts"] = sorted(set(_list(rec.get("hosts"))) | set(hosts))
-        data[sid] = rec
-        print(f"whoami-guard: session {sid[:8]}... (folder {rec['folder'] or '?'}) for {hours:g} h: "
-              f"mode={rec.get('mode') or 'normal'}, emails={rec['emails']}, hosts={rec['hosts']}")
-    HOME.mkdir(parents=True, exist_ok=True)
-    (HOME / "sessions.json").write_text(json.dumps(data, indent=1), encoding="utf-8")
+        try:
+            return _change(args, now)
+        finally:
+            try:
+                lock.unlink(missing_ok=True)
+            except OSError:
+                pass
+    data, remembered = _load(), _remembered()
+    for sid, v in data.items():
+        print(f"{sid[:8]}...  folder={v.get('folder', '')}  mode={v.get('mode') or 'normal'}  "
+              f"emails={v.get('emails', [])}  hosts={v.get('hosts', [])}  "
+              f"{round((_until(v) - now) / 3600, 1)} h left  remembered approvals={remembered.pop(sid, 0)}")
+    if not data:
+        print("whoami-guard: no session exceptions")
+    for sid, n in remembered.items():
+        print(f"{sid[:8]}...  remembered approvals={n} (no exception)")
+    for sid, folder, ts in _sessions()[:6]:  # the ids --session takes
+        print(f"session {sid[:12]}  folder={folder or '?'}  last call {round((now - ts) / 60)} min ago")
     return 0
+
+
+LOCK = "sessions.lock"
+LOCK_WAIT = 3.0  # seconds: wait for another whoami-guard-allow
+
+
+def _lock(home: Path | None = None) -> Path | None:
+    """A cross-process lock for the read-modify-write of sessions.json (O_CREAT|O_EXCL). None: not taken.
+    A lock left by a crashed run is never taken over automatically: two runs could both judge it stale and one could
+    remove the other's fresh lock (Sol review r3). The user deletes it, as the error message says."""
+    home = HOME if home is None else home
+    lock = home / LOCK
+    end = time.monotonic() + LOCK_WAIT
+    while True:
+        try:
+            home.mkdir(parents=True, exist_ok=True)
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            return lock
+        except FileExistsError:
+            pass
+        except OSError:
+            return None
+        if time.monotonic() > end:
+            return None
+        time.sleep(0.05)
+
+
+def _change(args: list[str], now: float) -> int:
+    """--clear or a new exception, called with the lock held."""
+    if any(a == "--control-once" or a.startswith("--control-once=") for a in args):
+        return _control_once(args)
+    if "--clear" in args:
+        # A new epoch revokes every approval and pending question at once, also one a PostToolUse writes back after
+        # the delete below (it carries the old epoch). Only this command writes sessions.json.
+        try:
+            _write({EPOCH_KEY: secrets.token_hex(8)})
+        except OSError as e:
+            print(f"whoami-guard: could not write sessions.json ({e}); exceptions and remembered approvals are "
+                  "STILL ACTIVE", file=sys.stderr)
+            return 1
+        print("whoami-guard: all session exceptions ended, remembered approvals revoked")
+        try:
+            (HOME / APPROVALS).unlink(missing_ok=True)
+        except OSError as e:
+            print(f"whoami-guard: the approvals file could not be deleted ({e}); its approvals are revoked anyway "
+                  "and count for nothing", file=sys.stderr)
+        return 0
+    data = _load()
+    prefix = next((a.split("=", 1)[1] for a in args if a.startswith("--session=")), "") or \
+        (_values(args, "--session") or [""])[0]
+    sid, folder, err = _pick_session(prefix.strip())
+    if err:
+        print(f"whoami-guard: {err}; nothing changed", file=sys.stderr)
+        return 1
+    emails, hosts = _values(args, "--email"), _values(args, "--host")
+    skip = {i + 1 for i, a in enumerate(args) if a in ("--email", "--host", "--session")}
+    nums = [a for i, a in enumerate(args) if i not in skip and a.replace(".", "", 1).isdigit()]
+    hours = float(nums[0]) if nums else 2.0
+    mode = "off" if "--off" in args else "ask" if ("--ask" in args or not (emails or hosts)) else ""
+    rec = data.get(sid, {})
+    rec.update(until=now + hours * 3600, folder=folder or rec.get("folder", ""))
+    if mode:
+        rec["mode"] = mode
+    rec["emails"] = sorted(set(_list(rec.get("emails"))) | set(emails))
+    rec["hosts"] = sorted(set(_list(rec.get("hosts"))) | set(hosts))
+    data[sid] = rec
+    epoch = _epoch()
+    if epoch == EPOCH_BROKEN:  # an unreadable file is replaced; approvals from before it stay revoked
+        epoch = secrets.token_hex(8)
+    try:
+        _write({**data, EPOCH_KEY: epoch})  # keep the revocation epoch
+    except OSError as e:
+        print(f"whoami-guard: could not write sessions.json ({e}); nothing changed", file=sys.stderr)
+        return 1
+    print(f"whoami-guard: session {sid[:8]}... (folder {rec['folder'] or '?'}) for {hours:g} h: "
+          f"mode={rec.get('mode') or 'normal'}, emails={rec['emails']}, hosts={rec['hosts']}")
+    return 0
+
+
+def _control_once(args: list[str]) -> int:
+    from egress_guard import control
+
+    # No defaults, implicit latest session, durations or other exception flags.
+    if len(args) != 4 or args[0] != "--control-once" or args[2] != "--session":
+        print("Use exactly --control-once DIGEST --session ID from the block message.", file=sys.stderr)
+        return 1
+    key, prefix = args[1], args[3]
+    if not prefix:
+        return 1
+    sid, _, err = _pick_session(prefix)
+    if err:
+        print(err, file=sys.stderr)
+        return 1
+    epoch = _epoch()
+    if epoch == EPOCH_BROKEN:
+        print("sessions.json is unreadable; no control approval granted.", file=sys.stderr)
+        return 1
+    try:
+        control.grant(HOME, sid, key, epoch)
+    except (OSError, ValueError) as e:
+        print(f"Control approval failed: {e}", file=sys.stderr)
+        return 1
+    print(f"One exact control operation approved for session {sid}; expires in 10 minutes. "
+          "Other checks remain active. Codex: this successful user command confirms execution; "
+          "retry the unchanged operation now, without asking for 'done' or another confirmation.")
+    return 0
+
+
+def _write(data: dict) -> None:
+    HOME.mkdir(parents=True, exist_ok=True)
+    tmp = HOME / f"sessions.json.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+    try:
+        os.replace(tmp, HOME / "sessions.json")
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 if __name__ == "__main__":

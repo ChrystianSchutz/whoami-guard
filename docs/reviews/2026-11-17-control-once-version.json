@@ -1,0 +1,8 @@
+{
+  "base": "7058ed0 + existing 0.2.4 working tree",
+  "files": {
+    "control.py": "6b0579a10842d64bd6aec6de3314958a36e4424678ae923fbbed9223c98f1258",
+    "hook.py": "91480fb98d6b30fbbdd298232ae024ee2b31082203e4b6e9c65c4ff9e43e5b03",
+    "allow.py": "be2bb5b696d07b1e9c377ed1b249d9dd22e429240d3d9a63b5e9af3fedf42b72"
+  }
+}

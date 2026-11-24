@@ -70,7 +70,7 @@ def test_malformed_sessions_never_crash(tmp_path, monkeypatch):
         assert decision(bash(f'curl -A "bot {EMAIL}" https://x.org')) == "deny"
         assert allow.main(["--list"]) == 0
     assert allow.main(["--clear"]) == 0
-    assert json.loads((tmp_path / "sessions.json").read_text()) == {}
+    assert list(json.loads((tmp_path / "sessions.json").read_text())) == [allow.EPOCH_KEY]  # only the epoch
 
 
 def test_allowed_url_does_not_exempt_other_destinations(tmp_path, monkeypatch):
